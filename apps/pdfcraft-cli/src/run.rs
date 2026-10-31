@@ -160,10 +160,92 @@ fn automation_roots(command: &str, args: &[String]) -> Result<(Option<Arc<pdfcra
     Ok((roots, left))
 }
 
+/// `pdfcraft-cli mcp`: in this fork the White Hat IQ craft-engine server
+/// (`pdfcraft_automation::whiq`); `--classic` (or the upstream-only `--compact` / `--root`) runs
+/// upstream's tool-table server instead.
 #[cfg(feature = "mcp")]
 pub(crate) fn mcp(args: &[String]) -> Result<(), CliError> {
     let (roots, args) = automation_roots("mcp", args)?;
-    let args = args.as_slice();
+    if args.iter().any(|a| a == "--classic" || a == "--compact" || a == "--root" || a.starts_with("--root=")) {
+        let args: Vec<String> = args.into_iter().filter(|a| a != "--classic").collect();
+        return mcp_classic(roots, &args);
+    }
+    whiq_mcp(roots, &args)
+}
+
+/// The WHIQ server's flags (CONTRACT-PARITY.md §2 names; the older GridCraft spellings too).
+#[cfg(feature = "mcp")]
+fn whiq_settings(args: &[String]) -> Result<pdfcraft_automation::whiq::Settings, String> {
+    let mut s = pdfcraft_automation::whiq::Settings::default();
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        let (flag, inline) = arg.split_once('=').map_or((arg.as_str(), None), |(f, v)| (f, Some(v.to_string())));
+        if flag == "--automation-no-old-copies" {
+            s.no_old_copies = true;
+            continue;
+        }
+        let mut value = || -> Result<String, String> {
+            match &inline {
+                Some(v) => Ok(v.clone()),
+                None => it.next().cloned().ok_or_else(|| format!("mcp: {flag} needs a value")),
+            }
+        };
+        let num = |v: String| -> Result<u64, String> { v.trim().parse::<u64>().map_err(|_| format!("mcp: {flag} needs a whole number, not {v:?}")) };
+        match flag {
+            "--author" => s.author = Some(value()?),
+            "--busy-after-ms" => s.busy_after_ms = num(value()?)?,
+            "--job-after-ms" | "--call-timeout-ms" => s.job_after_ms = num(value()?)?,
+            "--open-job-mb" | "--job-open-mb" => {
+                let v = value()?;
+                let mb: f64 = v.trim().parse().map_err(|_| format!("mcp: {flag} needs a number of MB, not {v:?}"))?;
+                if !(mb.is_finite() && mb >= 0.0) {
+                    return Err(format!("mcp: {flag} needs a number of MB, not {v:?}"));
+                }
+                s.open_job_bytes = (mb * 1024.0 * 1024.0) as u64;
+            }
+            "--idle-evict-secs" | "--evict-idle-secs" => s.idle_evict_secs = Some(num(value()?)?).filter(|n| *n > 0),
+            "--max-memory-mb" => s.max_memory_mb = Some(num(value()?)?).filter(|n| *n > 0),
+            "--max-result-bytes" => s.max_result_bytes = usize::try_from(num(value()?)?.max(1024)).unwrap_or(usize::MAX),
+            "--max-result-kb" => s.max_result_bytes = usize::try_from(num(value()?)?.saturating_mul(1024).max(1024)).unwrap_or(usize::MAX),
+            "--preview-max-bytes" => s.preview_max_bytes = usize::try_from(num(value()?)?.max(4096)).unwrap_or(usize::MAX),
+            "--checkpoint-edits" => s.checkpoint_edits = u32::try_from(num(value()?)?).unwrap_or(u32::MAX),
+            "--checkpoint-secs" => s.checkpoint_secs = num(value()?)?,
+            _ => {
+                return Err(format!(
+                    "mcp: unknown option {arg} (the WHIQ server takes --author, --automation-read-root, --automation-write-root, --automation-no-old-copies, --busy-after-ms, --job-after-ms, --open-job-mb, --idle-evict-secs, --max-memory-mb, --max-result-bytes, --checkpoint-edits, --checkpoint-secs; --classic runs the upstream server)"
+                ));
+            }
+        }
+    }
+    Ok(s)
+}
+
+#[cfg(feature = "mcp")]
+fn whiq_mcp(roots: Option<Arc<pdfcraft_automation::file_access::AutomationRoots>>, args: &[String]) -> Result<(), CliError> {
+    let mut settings = whiq_settings(args).map_err(CliError::Message)?;
+    if let Some(r) = &roots {
+        settings.read_root = r.read_root().map(Path::to_path_buf);
+        settings.write_root = r.write_root().map(Path::to_path_buf);
+    }
+    // The server reads back what it writes (a converted PDF it opens, split parts, recovered
+    // files): the write root is readable too. Nothing outside the two roots is.
+    let roots = match &roots {
+        Some(r) => pdfcraft_automation::file_access::AutomationRoots::new_write_readable(r.read_root(), r.write_root()).map_err(CliError::Message)?,
+        None => None,
+    };
+    let _ = writeln!(
+        std::io::stderr().lock(),
+        "pdfcraft-cli: WHIQ MCP server on stdio (protocol {}); read root {}, write root {}; close stdin to stop",
+        pdfcraft_automation::whiq::PROTOCOL_VERSIONS[0],
+        settings.read_root.as_deref().map_or_else(|| "none".to_string(), |r| r.display().to_string()),
+        settings.write_root.as_deref().map_or_else(|| "none".to_string(), |r| r.display().to_string()),
+    );
+    let make = move || pdfcraft_automation::Automation::new().with_automation_roots(roots);
+    pdfcraft_automation::whiq::serve(make, settings, std::io::stdin().lock(), std::io::stdout()).map_err(|e| CliError::Message(e.to_string()))
+}
+
+#[cfg(feature = "mcp")]
+fn mcp_classic(roots: Option<Arc<pdfcraft_automation::file_access::AutomationRoots>>, args: &[String]) -> Result<(), CliError> {
     validate_options("mcp", args, MCP_OPTIONS)?;
     let compact = args.iter().any(|a| a == "--compact");
     let mut auto = automation(args)?;

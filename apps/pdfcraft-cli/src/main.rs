@@ -35,8 +35,15 @@ use pdfcraft_render::{PageRenderer, RenderConfig, RenderRequest, RequestKind, in
 macro_rules! mcp_usage {
     () => {
         "\
-pdfcraft-cli mcp    [--root DIR] [--compact] [--automation-read-root DIR] [--automation-write-root DIR]
-                                                           MCP server on stdin/stdout (opt-in)
+pdfcraft-cli mcp    [--automation-read-root DIR] [--automation-write-root DIR] [--author NAME]
+                    [--automation-no-old-copies] [--busy-after-ms N] [--job-after-ms N] [--open-job-mb N]
+                    [--idle-evict-secs N] [--max-memory-mb N] [--max-result-bytes N]
+                    [--checkpoint-edits N] [--checkpoint-secs N]
+                                                           the White Hat IQ craft-engine MCP server on stdin/stdout
+                                                           (opt-in; WHIQ-CHANGES.md): read, search, list_content,
+                                                           render_preview, edit, convert, combine, ocr…
+pdfcraft-cli mcp --classic [--root DIR] [--compact] [--automation-read-root DIR] [--automation-write-root DIR]
+                                                           upstream's tool-table MCP server on stdin/stdout (opt-in)
                                                            --compact lists a core set of tools plus tool_search and tool_call
                                                            --automation-read-root / --automation-write-root confine the files the
                                                            agent's tools read (open, combine, import, fonts, certificates…) and

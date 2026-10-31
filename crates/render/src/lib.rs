@@ -13,6 +13,7 @@ mod pixels;
 mod raster;
 mod reading;
 mod structure;
+pub mod svg;
 pub mod text;
 pub mod transition;
 
@@ -26,6 +27,7 @@ pub use raster::{
     Retiring, Tile, device_pixels, effective_scale,
 };
 pub use reading::{ReadingColors, ReadingParams};
+pub use svg::{SvgPage, SvgRenderer};
 pub use text::{PageText, TextGlyph};
 
 /// Errors surfaced to the user when a document cannot be opened.

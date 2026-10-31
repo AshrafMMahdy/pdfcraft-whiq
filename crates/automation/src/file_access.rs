@@ -36,6 +36,9 @@ pub enum Access {
 pub struct AutomationRoots {
     read: Option<Root>,
     write: Option<Root>,
+    /// Files inside the write root may be read too (the WHIQ server reads back what it wrote:
+    /// a converted PDF it opens, a split part, a recovered file). Off unless asked for.
+    write_readable: bool,
 }
 
 #[derive(Debug)]
@@ -69,7 +72,18 @@ impl AutomationRoots {
         }
         let read = read.map(|p| Root::open(p, Access::Read)).transpose()?;
         let write = write.map(|p| Root::open(p, Access::Write)).transpose()?;
-        Ok(Some(Arc::new(Self { read, write })))
+        Ok(Some(Arc::new(Self { read, write, write_readable: false })))
+    }
+
+    /// [`new`](Self::new), with the files inside the write root readable as well as writable:
+    /// what a server writes there it may open again. Reads outside both roots stay refused.
+    pub fn new_write_readable(read: Option<&Path>, write: Option<&Path>) -> Result<Option<Arc<Self>>, String> {
+        if read.is_none() && write.is_none() {
+            return Ok(None);
+        }
+        let read = read.map(|p| Root::open(p, Access::Read)).transpose()?;
+        let write = write.map(|p| Root::open(p, Access::Write)).transpose()?;
+        Ok(Some(Arc::new(Self { read, write, write_readable: true })))
     }
 
     /// The read root, absolute with its links followed.
@@ -90,6 +104,15 @@ impl AutomationRoots {
     /// [`check`](Self::check) for a path that was already put together from `shown` (the way the
     /// caller wrote it, which is what refusals quote).
     pub fn check_path(&self, shown: &str, target: &Path, access: Access) -> Result<(), String> {
+        if matches!(access, Access::Read)
+            && self.write_readable
+            && let Some(w) = &self.write
+            && let Ok(absolute) = absolute(shown, target)
+            && !foreign_share(&absolute, &w.resolved)
+            && resolve(shown, &absolute).is_ok_and(|r| inside(&r, &w.resolved))
+        {
+            return Ok(());
+        }
         let root = match access {
             Access::Read => self.read.as_ref(),
             Access::Write => self.write.as_ref(),

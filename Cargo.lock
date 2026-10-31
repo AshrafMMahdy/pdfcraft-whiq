@@ -1420,6 +1420,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ctrlc"
+version = "3.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e0b1fab2ae45819af2d0731d60f2afe17227ebb1a1538a236da84c93e9a60162"
+dependencies = [
+ "dispatch2",
+ "nix",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "ctutils"
 version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2749,6 +2760,18 @@ name = "hayro-postscript"
 version = "0.1.0"
 
 [[package]]
+name = "hayro-svg"
+version = "0.7.0"
+dependencies = [
+ "base64 0.22.1",
+ "hayro-interpret",
+ "image",
+ "kurbo 0.13.1",
+ "siphasher",
+ "xmlwriter",
+]
+
+[[package]]
 name = "hayro-syntax"
 version = "0.7.2"
 dependencies = [
@@ -3491,6 +3514,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
 dependencies = [
  "autocfg",
+]
+
+[[package]]
+name = "memory-stats"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c73f5c649995a115e1a0220b35e4df0a1294500477f97a91d0660fb5abeb574a"
+dependencies = [
+ "libc",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4268,10 +4301,16 @@ name = "pdfcraft-automation"
 version = "0.15.0"
 dependencies = [
  "base64 0.23.1",
+ "chrono",
+ "ctrlc",
  "flate2",
  "image",
+ "memory-stats",
  "pdfcraft-cos",
+ "pdfcraft-create",
+ "pdfcraft-edit",
  "pdfcraft-engine",
+ "pdfcraft-export",
  "pdfcraft-fonts",
  "pdfcraft-model",
  "pdfcraft-organize",
@@ -4279,6 +4318,7 @@ dependencies = [
  "pdfcraft-render",
  "pdfcraft-xfa",
  "png 0.18.1",
+ "pulldown-cmark",
  "rustix 1.1.5",
  "serde_json",
  "sha2 0.11.1",
@@ -4300,6 +4340,7 @@ dependencies = [
  "png 0.18.1",
  "rustix 1.1.5",
  "serde_json",
+ "tempfile",
  "winresource",
 ]
 
@@ -4595,6 +4636,7 @@ dependencies = [
  "flate2",
  "getrandom 0.4.3",
  "hayro",
+ "hayro-svg",
  "hayro-syntax",
  "kurbo 0.13.1",
  "log",
@@ -5179,6 +5221,17 @@ dependencies = [
  "rusty-fork",
  "tempfile",
  "unarray",
+]
+
+[[package]]
+name = "pulldown-cmark"
+version = "0.13.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3db2be46835f013dd3f4fa7f5f7402c537787b54ebb6fe2b94bbdd7e2669bb7b"
+dependencies = [
+ "bitflags 2.13.2",
+ "memchr",
+ "unicase",
 ]
 
 [[package]]
@@ -6765,7 +6818,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.5",
  "windows-sys 0.61.2",
@@ -7163,6 +7216,12 @@ name = "unarray"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eaea85b334db583fe3274d12b4cd1880032beab409c0d774be044d4480ab9a94"
+
+[[package]]
+name = "unicase"
+version = "2.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "357cc3acc6a036009fd6c973ed009037c732d60d0b4f6c673e9041497482a28f"
 
 [[package]]
 name = "unicode-bidi"

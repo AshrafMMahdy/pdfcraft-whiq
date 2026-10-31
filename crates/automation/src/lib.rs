@@ -32,6 +32,8 @@ mod redact;
 mod signing;
 mod text_cache;
 mod tools;
+#[cfg(feature = "mcp")]
+pub mod whiq;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};

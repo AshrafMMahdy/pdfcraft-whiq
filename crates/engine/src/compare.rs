@@ -194,16 +194,27 @@ impl crate::Document {
     /// pictures went past `image_budget` bytes ([`OfficeExport::truncated_pages`]). Without
     /// `images` no picture is prepared.
     pub(crate) fn export_pages_checked(&self, images: bool, image_budget: usize) -> (Vec<pdfcraft_export::Page>, Vec<usize>) {
+        self.export_pages_of(0..self.info.pages.len(), images, image_budget)
+    }
+
+    /// [`Self::export_pages`] for a window of pages only (0-based indices, in the order given;
+    /// indices past the end are skipped), so a reader of a 2,000-page file lays out only the pages
+    /// it asks for. Without `images` no picture is prepared. Also returns the pages (of the window,
+    /// 0-based document indices) whose forms were left partly unread or whose pictures went past
+    /// the budget.
+    pub fn export_pages_window(&self, pages: &[usize], images: bool) -> (Vec<pdfcraft_export::Page>, Vec<usize>) {
+        let all = self.info.pages.len();
+        self.export_pages_of(pages.iter().copied().filter(|&p| p < all), images, MAX_EXPORT_IMAGE_BYTES)
+    }
+
+    fn export_pages_of(&self, which: impl Iterator<Item = usize>, images: bool, image_budget: usize) -> (Vec<pdfcraft_export::Page>, Vec<usize>) {
         let Some(cos) = self.editor.as_ref().map(|e| &e.cos) else { return (Vec::new(), Vec::new()) };
         let mut truncated = Vec::new();
         // Each image object is encoded once and shared by every place that draws it.
         let mut encoded: HashMap<ObjRef, PreparedImage> = HashMap::new();
         let mut image_bytes = image_budget;
-        let pages = self
-            .info
-            .pages
-            .iter()
-            .enumerate()
+        let pages = which
+            .filter_map(|i| self.info.pages.get(i).map(|info| (i, info)))
             .map(|(i, info)| {
                 // Export uses the visible page in points, y up. Raw PDF coordinates include
                 // CropBox offsets and precede /Rotate and /UserUnit.

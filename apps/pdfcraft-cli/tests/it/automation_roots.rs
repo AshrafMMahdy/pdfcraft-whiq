@@ -32,7 +32,8 @@ fn folders(tag: &str) -> PathBuf {
 
 /// Run `mcp <flags>`, send `calls` as `tools/call` requests and return the replies.
 fn session(flags: &[String], calls: &[(&str, Value)]) -> (Vec<Value>, String) {
-    let mut child = Command::new(BIN).arg("mcp").args(flags).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let mut child =
+        Command::new(BIN).args(["mcp", "--classic"]).args(flags).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
     let mut input = String::from("{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\",\"params\":{}}\n");
     for (i, (name, args)) in calls.iter().enumerate() {
         let r = json!({"jsonrpc": "2.0", "id": i + 1, "method": "tools/call", "params": {"name": name, "arguments": args}});
@@ -102,7 +103,7 @@ fn no_flags_means_no_confinement() {
 }
 
 fn fails(args: &[&str]) -> String {
-    let out: Output = Command::new(BIN).arg("mcp").args(args).stdin(Stdio::null()).output().unwrap();
+    let out: Output = Command::new(BIN).args(["mcp", "--classic"]).args(args).stdin(Stdio::null()).output().unwrap();
     assert_eq!(out.status.code(), Some(1), "{args:?} should fail");
     assert!(out.stdout.is_empty(), "{args:?} must not start a server");
     String::from_utf8(out.stderr).unwrap()

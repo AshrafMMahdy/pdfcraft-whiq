@@ -19,6 +19,7 @@ use crate::{
 };
 
 mod editing;
+pub use editing::BatchCheckpoint;
 mod files;
 mod save;
 mod view;

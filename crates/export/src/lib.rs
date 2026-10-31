@@ -30,11 +30,11 @@ pub(crate) use as_html::esc;
 pub use as_html::html;
 #[cfg(test)]
 use as_html::{allowed, base64};
-pub use as_markdown::markdown;
 #[cfg(test)]
 use as_markdown::{emphasis, paragraph};
+pub use as_markdown::{markdown, markdown_pages};
 pub use as_rtf::rtf;
-pub use layout::{Block, Cell, Image, Page, Table};
+pub use layout::{Block, Cell, Image, Page, Table, reading_order};
 #[cfg(test)]
 use layout::{LOOKUP_STEPS, MAX_COLS, body_size};
 pub(crate) use layout::{Run, paragraphs, tables};

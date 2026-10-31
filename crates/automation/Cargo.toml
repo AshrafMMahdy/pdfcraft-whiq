@@ -18,15 +18,24 @@ serde_json = { workspace = true }
 sha2 = "0.11"
 tempfile = "3.27"
 base64 = { version = "0.23", optional = true }
+# WHIQ craft-engine server (src/whiq): structured reading, Markdown/HTML to PDF, the contract's
+# memory reading and signal auto-save.
+pdfcraft-export = { workspace = true }
+pdfcraft-create = { workspace = true }
+pdfcraft-edit = { workspace = true }
+pdfcraft-fonts = { workspace = true }
+chrono = { workspace = true }
+pulldown-cmark = { version = "0.13", default-features = false }
+memory-stats = { version = "1.2", optional = true }
+ctrlc = { version = "3.4", features = ["termination"], optional = true }
 
 
 [features]
 default = ["mcp"]
 # The MCP server module. Opt-in at run time either way; disable to leave it out of the build.
-mcp = ["dep:base64"]
+mcp = ["dep:base64", "dep:memory-stats", "dep:ctrlc"]
 
 [dev-dependencies]
-pdfcraft-fonts = { workspace = true }
 png = "0.18"
 flate2.workspace = true
 pdfcraft-model = { workspace = true }

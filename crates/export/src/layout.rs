@@ -461,8 +461,118 @@ pub(crate) fn items(pages: &[Page]) -> Vec<Item<'_>> {
             .collect();
         parts.extend(tables.into_iter().map(|t| (t.rect[3], t.rect[0], Item::Table(t))));
         parts.extend(p.images.iter().map(|im| (im.rect[3], im.rect[0], Item::Img(im))));
-        parts.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.total_cmp(&b.1)));
-        out.extend(parts.into_iter().map(|x| x.2));
+        // Reading order: columns one after another (a recursive XY cut), top to bottom in each.
+        let rects: Vec<[f64; 4]> = parts.iter().map(|(_, _, it)| item_rect(it)).collect();
+        let order = reading_order(&rects);
+        let mut slots: Vec<Option<Item>> = parts.into_iter().map(|x| Some(x.2)).collect();
+        out.extend(order.into_iter().filter_map(|i| slots.get_mut(i).and_then(Option::take)));
     }
     out
+}
+
+/// The box an item covers, [x0, y0, x1, y1] (y up).
+fn item_rect(it: &Item<'_>) -> [f64; 4] {
+    match it {
+        Item::Para(runs, _) => runs
+            .iter()
+            .map(|r| r.block.rect)
+            .fold([f64::MAX, f64::MAX, f64::MIN, f64::MIN], |a, b| [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])]),
+        Item::Table(t) => t.rect,
+        Item::Img(im) => im.rect,
+        Item::PageBreak => [0.0; 4],
+    }
+}
+
+/// The narrowest vertical gutter between two columns, in points.
+const MIN_GUTTER: f64 = 4.0;
+/// How deep the cuts go before the rest is read top to bottom (bounded recursion).
+const MAX_CUT_DEPTH: usize = 48;
+
+/// The reading order of boxes [x0, y0, x1, y1] (y up) on one page: a recursive XY cut. Where a
+/// vertical gutter that nothing crosses splits the boxes, the left side is read before the right
+/// (two columns are read column by column); otherwise the widest horizontal gap splits them into
+/// what is above and what is below (a title across both columns comes first). A split whose two
+/// sides sit on the same lines (labels and their values, a form's rows) is not a column split.
+/// What no cut splits is read top to bottom, left to right. Non-finite coordinates count as 0.
+pub fn reading_order(rects: &[[f64; 4]]) -> Vec<usize> {
+    let clean: Vec<[f64; 4]> = rects.iter().map(|r| r.map(|v| if v.is_finite() { v } else { 0.0 })).collect();
+    let mut out = Vec::with_capacity(clean.len());
+    cut(&clean, (0..clean.len()).collect(), 0, &mut out);
+    out
+}
+
+fn by_position(rects: &[[f64; 4]], idx: &mut [usize]) {
+    let at = |i: usize| rects.get(i).copied().unwrap_or([0.0; 4]);
+    idx.sort_by(|&a, &b| at(b)[3].total_cmp(&at(a)[3]).then(at(a)[0].total_cmp(&at(b)[0])));
+}
+
+fn cut(rects: &[[f64; 4]], mut idx: Vec<usize>, depth: usize, out: &mut Vec<usize>) {
+    if idx.len() <= 1 || depth >= MAX_CUT_DEPTH {
+        by_position(rects, &mut idx);
+        out.extend(idx);
+        return;
+    }
+    let at = |i: usize| rects.get(i).copied().unwrap_or([0.0; 4]);
+    // A vertical gutter: sorted by left edge, a box starting right of everything before it.
+    idx.sort_by(|&a, &b| at(a)[0].total_cmp(&at(b)[0]));
+    let mut best: Option<(f64, usize)> = None;
+    let mut right = f64::MIN;
+    for (k, &i) in idx.iter().enumerate() {
+        let r = at(i);
+        if k > 0 && r[0] - right >= MIN_GUTTER && best.is_none_or(|b| r[0] - right > b.0) {
+            best = Some((r[0] - right, k));
+        }
+        right = right.max(r[2]);
+    }
+    if let Some((_, k)) = best {
+        let (l, r) = idx.split_at(k);
+        if !same_lines(rects, l, r) {
+            let (l, r) = (l.to_vec(), r.to_vec());
+            cut(rects, l, depth + 1, out);
+            cut(rects, r, depth + 1, out);
+            return;
+        }
+    }
+    // A horizontal gap: sorted by top edge, a box starting below everything above it.
+    idx.sort_by(|&a, &b| at(b)[3].total_cmp(&at(a)[3]));
+    let mut best: Option<(f64, usize)> = None;
+    let mut bottom = f64::MAX;
+    for (k, &i) in idx.iter().enumerate() {
+        let r = at(i);
+        if k > 0 && bottom - r[3] > 0.5 && best.is_none_or(|b| bottom - r[3] > b.0) {
+            best = Some((bottom - r[3], k));
+        }
+        bottom = bottom.min(r[1]);
+    }
+    if let Some((_, k)) = best {
+        let (u, d) = idx.split_at(k);
+        let (u, d) = (u.to_vec(), d.to_vec());
+        cut(rects, u, depth + 1, out);
+        cut(rects, d, depth + 1, out);
+        return;
+    }
+    by_position(rects, &mut idx);
+    out.extend(idx);
+}
+
+/// Whether the two sides are rows of labels and values rather than two columns of text: one
+/// side much narrower than the other (under 40% of its width) and most boxes of the smaller side
+/// with a box on the other side starting on the same line (tops within 2 points). Columns of
+/// similar width are columns even when their lines line up (a scan's lines, side by side).
+fn same_lines(rects: &[[f64; 4]], a: &[usize], b: &[usize]) -> bool {
+    let top = |i: &usize| rects.get(*i).map_or(0.0, |r| r[3]);
+    let span = |side: &[usize]| {
+        let (l, r) = side.iter().filter_map(|i| rects.get(*i)).fold((f64::MAX, f64::MIN), |(l, r), x| (l.min(x[0]), r.max(x[2])));
+        (r - l).max(0.0)
+    };
+    let (wa, wb) = (span(a), span(b));
+    if wa.min(wb) >= 0.4 * wa.max(wb) {
+        return false;
+    }
+    let (small, big) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+    if small.is_empty() {
+        return false;
+    }
+    let paired = small.iter().filter(|s| big.iter().any(|g| (top(s) - top(g)).abs() < 2.0)).count();
+    paired * 2 > small.len()
 }

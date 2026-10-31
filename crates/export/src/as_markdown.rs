@@ -102,50 +102,105 @@ fn cell(c: &Cell) -> String {
 /// Markdown (CommonMark, with GitHub's pipe tables): headings, paragraphs with bold and italic,
 /// tables with their first row as the header, and a rule between pages. Images are left out.
 pub fn markdown(pages: &[Page]) -> String {
-    let mut blocks: Vec<String> = Vec::new();
-    for it in items(pages) {
-        match it {
-            Item::Para(runs, lvl) => {
-                // A heading's weight is the heading's own, as in the HTML export.
-                let runs: Vec<(&str, bool, bool)> = runs.iter().map(|r| (r.text.as_str(), r.block.bold && lvl == 0, r.block.italic)).collect();
-                let text = paragraph(&runs);
-                let text = text.trim();
-                if text.is_empty() {
-                    continue;
-                }
-                blocks.push(match lvl {
-                    0 => block_start(text.to_string()),
-                    l => format!("{} {text}", "#".repeat(usize::from(l.min(MAX_HEADING)))),
-                });
-            }
-            Item::Table(t) => {
-                // Each row as wide as the widest; a cell spanning columns is followed by empty ones.
-                // Detected tables have at most MAX_COLS columns, and a span never counts for more.
-                let span = |c: &Cell| c.span.clamp(1, MAX_COLS);
-                let width = t.rows.iter().map(|r| r.iter().map(span).fold(0usize, usize::saturating_add)).max().unwrap_or(0);
-                if width == 0 {
-                    continue;
-                }
-                let mut lines = Vec::with_capacity(t.rows.len().saturating_add(1));
-                for (i, row) in t.rows.iter().enumerate() {
-                    let mut cells: Vec<String> = Vec::with_capacity(width);
-                    for c in row {
-                        cells.push(cell(c));
-                        cells.extend(std::iter::repeat_n(String::new(), span(c).saturating_sub(1)));
-                    }
-                    cells.resize(width, String::new());
-                    lines.push(format!("| {} |", cells.join(" | ")));
-                    if i == 0 {
-                        lines.push(format!("|{}", " --- |".repeat(width)));
-                    }
-                }
-                blocks.push(lines.join("\n"));
-            }
-            Item::Img(_) => {}
-            Item::PageBreak => blocks.push("---".into()),
-        }
-    }
+    let blocks: Vec<String> = items(pages).into_iter().filter_map(item_markdown).collect();
     let mut s = blocks.join("\n\n");
     s.push('\n');
     s
+}
+
+/// [`markdown`] page by page: one Markdown text per page given, in order and without the rule
+/// between pages, with heading levels measured against the body size of all the pages given (as
+/// [`markdown`] measures them). A page with no text is an empty string.
+pub fn markdown_pages(pages: &[Page]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(pages.len());
+    let mut blocks: Vec<String> = Vec::new();
+    for it in items(pages) {
+        if matches!(it, Item::PageBreak) {
+            out.push(blocks.join("\n\n"));
+            blocks.clear();
+        } else if let Some(b) = item_markdown(it) {
+            blocks.push(b);
+        }
+    }
+    if !pages.is_empty() {
+        out.push(blocks.join("\n\n"));
+    }
+    out
+}
+
+/// One paragraph, heading, table or page rule as Markdown; `None` for what Markdown leaves out.
+fn item_markdown(it: Item<'_>) -> Option<String> {
+    match it {
+        Item::Para(runs, lvl) => {
+            // A heading's weight is the heading's own, as in the HTML export.
+            let runs: Vec<(&str, bool, bool)> = runs.iter().map(|r| (r.text.as_str(), r.block.bold && lvl == 0, r.block.italic)).collect();
+            let text = paragraph(&runs);
+            let text = text.trim();
+            if text.is_empty() {
+                return None;
+            }
+            Some(match lvl {
+                0 => block_start(text.to_string()),
+                l => format!("{} {text}", "#".repeat(usize::from(l.min(MAX_HEADING)))),
+            })
+        }
+        Item::Table(t) => {
+            // Each row as wide as the widest; a cell spanning columns is followed by empty ones.
+            // Detected tables have at most MAX_COLS columns, and a span never counts for more.
+            let span = |c: &Cell| c.span.clamp(1, MAX_COLS);
+            let width = t.rows.iter().map(|r| r.iter().map(span).fold(0usize, usize::saturating_add)).max().unwrap_or(0);
+            if width == 0 {
+                return None;
+            }
+            let mut grid: Vec<Vec<String>> = Vec::with_capacity(t.rows.len());
+            for row in &t.rows {
+                let mut cells: Vec<String> = Vec::with_capacity(width);
+                for c in row {
+                    cells.push(cell(c));
+                    cells.extend(std::iter::repeat_n(String::new(), span(c).saturating_sub(1)));
+                }
+                cells.resize(width, String::new());
+                grid.push(cells);
+            }
+            let grid = merge_sparse_columns(grid);
+            let width = grid.first().map_or(width, Vec::len);
+            let mut lines = Vec::with_capacity(t.rows.len().saturating_add(1));
+            for (i, cells) in grid.iter().enumerate() {
+                lines.push(format!("| {} |", cells.join(" | ")));
+                if i == 0 {
+                    lines.push(format!("|{}", " --- |".repeat(width)));
+                }
+            }
+            Some(lines.join("\n"))
+        }
+        Item::Img(_) => None,
+        Item::PageBreak => Some("---".into()),
+    }
+}
+
+/// Neighbouring columns that no row fills both of, joined into one: a column of right-aligned
+/// numbers starts at a different place on each row, and the table detector gives each start a
+/// grid column of its own, so `Qty` stood over three columns holding its numbers in turn. A row
+/// with text in both (the header names both) keeps them apart.
+pub(crate) fn merge_sparse_columns(grid: Vec<Vec<String>>) -> Vec<Vec<String>> {
+    let width = grid.iter().map(Vec::len).max().unwrap_or(0);
+    if width < 2 || grid.len() < 2 {
+        return grid;
+    }
+    let filled = |row: &Vec<String>, c: usize| row.get(c).is_some_and(|s| !s.trim().is_empty());
+    // groups[g] = the grid columns joined into output column g.
+    let mut groups: Vec<Vec<usize>> = vec![vec![0]];
+    for c in 1..width {
+        let joinable = groups.last().is_some_and(|g| !grid.iter().any(|row| g.iter().any(|&k| filled(row, k)) && filled(row, c)));
+        match groups.last_mut() {
+            Some(g) if joinable => g.push(c),
+            _ => groups.push(vec![c]),
+        }
+    }
+    if groups.len() == width {
+        return grid;
+    }
+    grid.iter()
+        .map(|row| groups.iter().map(|g| g.iter().find_map(|&k| row.get(k).filter(|s| !s.trim().is_empty()).cloned()).unwrap_or_default()).collect())
+        .collect()
 }

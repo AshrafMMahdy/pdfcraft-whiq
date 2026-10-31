@@ -8,6 +8,12 @@ use super::{
 };
 use crate::{EditNotice, MarkKind};
 
+/// A document's editing state saved by [`Session::batch_checkpoint`].
+pub struct BatchCheckpoint {
+    editor: crate::history::Editor,
+    dirty: bool,
+}
+
 impl Session {
     /// Apply an edit. On success the previous state is undoable and the view data is refreshed.
     pub fn apply(&mut self, id: DocId, edit: Edit) -> Result<(), EditError> {
@@ -244,6 +250,27 @@ impl Session {
         Self::sync_dirty(doc);
         doc.generation += 1;
         Ok(label)
+    }
+
+    /// The document's whole editing state now (its objects, keys and undo history), for a batch
+    /// of edits that must leave the document exactly as it was when one of them fails
+    /// ([`Session::batch_restore`]). Unlike undo it is not limited to the last [`MAX_UNDO`] steps.
+    /// `None` when the document is not open or cannot be edited.
+    pub fn batch_checkpoint(&self, id: DocId) -> Option<BatchCheckpoint> {
+        let doc = self.get(id)?;
+        Some(BatchCheckpoint { editor: doc.editor.clone()?, dirty: doc.dirty })
+    }
+
+    /// Put the document back as [`Session::batch_checkpoint`] took it, undo history included.
+    pub fn batch_restore(&mut self, id: DocId, checkpoint: BatchCheckpoint) -> Result<(), EditError> {
+        let doc = self.doc_mut(id)?;
+        doc.editor = Some(checkpoint.editor);
+        Self::adopt_keys(doc);
+        guard(|| Self::refresh(doc)).unwrap_or_else(|m| Err(EditError::Reopen(m)))?;
+        doc.dirty = checkpoint.dirty;
+        doc.edit_notices.clear();
+        doc.generation += 1;
+        Ok(())
     }
 
     pub fn redo(&mut self, id: DocId) -> Result<Label, EditError> {

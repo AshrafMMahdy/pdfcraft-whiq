@@ -841,3 +841,68 @@ fn markdown_escapes_markup_and_keeps_emphasis_and_tables() {
     assert!(rows.contains(&"| A1 | kWh | 37414.00 |"), "{md}");
     assert!(rows.iter().all(|r| r.matches(" | ").count() == 2), "every row has the header's three cells: {md}");
 }
+
+/// A block of body text at `rect` (y up).
+fn body(text: &str, rect: [f64; 4]) -> Block {
+    Block { text: text.into(), rect, size: 10.0, bold: false, italic: false, color: [0.0; 3], rotation: 0.0, space_around: [false; 2] }
+}
+
+#[test]
+fn two_columns_are_read_column_by_column_after_a_title_across_both() {
+    let mut title = body("Report title", [50.0, 760.0, 545.0, 780.0]);
+    title.size = 20.0;
+    let page = Page {
+        width: 595.0,
+        height: 842.0,
+        blocks: vec![
+            title,
+            body("Left one.", [50.0, 650.0, 280.0, 700.0]),
+            body("Right one.", [315.0, 640.0, 545.0, 696.0]),
+            body("Left two.", [50.0, 550.0, 280.0, 600.0]),
+            body("Right two.", [315.0, 540.0, 545.0, 596.0]),
+        ],
+        images: Vec::new(),
+        background: None,
+    };
+    let md = markdown(&[page]);
+    let at = |s: &str| md.find(s).unwrap_or_else(|| panic!("{s} missing: {md}"));
+    assert!(at("Report title") < at("Left one."), "{md}");
+    assert!(at("Left one.") < at("Left two."), "{md}");
+    assert!(at("Left two.") < at("Right one."), "{md}");
+    assert!(at("Right one.") < at("Right two."), "{md}");
+}
+
+#[test]
+fn labels_and_their_values_are_read_row_by_row() {
+    let mut blocks = Vec::new();
+    for (k, (label, value)) in [("Name:", "Ada"), ("Site:", "Dorra yard"), ("Date:", "Monday")].iter().enumerate() {
+        let y = 700.0 - k as f64 * 30.0;
+        blocks.push(body(label, [50.0, y, 90.0, y + 12.0]));
+        blocks.push(body(value, [200.0, y, 520.0, y + 12.0]));
+    }
+    let order = reading_order(&blocks.iter().map(|b| b.rect).collect::<Vec<_>>());
+    assert_eq!(order, vec![0, 1, 2, 3, 4, 5]);
+}
+
+#[test]
+fn reading_order_is_total_on_odd_boxes() {
+    assert!(reading_order(&[]).is_empty());
+    let odd = [[f64::NAN, 0.0, 1.0, 1.0], [f64::INFINITY; 4], [5.0, 5.0, 4.0, 4.0]];
+    let mut o = reading_order(&odd);
+    o.sort_unstable();
+    assert_eq!(o, vec![0, 1, 2]);
+    // Deep piles of boxes stop cutting at the depth bound and are still all read.
+    let many: Vec<[f64; 4]> = (0..2000).map(|i| [0.0, -(i as f64) * 3.0, 10.0, -(i as f64) * 3.0 + 1.0]).collect();
+    assert_eq!(reading_order(&many).len(), 2000);
+}
+
+#[test]
+fn right_aligned_number_columns_are_joined_under_their_header() {
+    let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+    let grid = vec![s(&["Item", "Qty", "", "", "Rate"]), s(&["1", "", "523", "", "3.5"]), s(&["2", "", "", "27", "4.0"])];
+    let out = super::as_markdown::merge_sparse_columns(grid);
+    assert_eq!(out, vec![s(&["Item", "Qty", "Rate"]), s(&["1", "523", "3.5"]), s(&["2", "27", "4.0"])]);
+    // A full table is left alone.
+    let full = vec![s(&["a", "b"]), s(&["1", "2"])];
+    assert_eq!(super::as_markdown::merge_sparse_columns(full.clone()), full);
+}

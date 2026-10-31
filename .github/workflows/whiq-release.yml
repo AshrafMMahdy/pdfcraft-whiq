@@ -1,0 +1,272 @@
+name: whiq-release
+
+# WHIQ fork: the headless `pdfcraft-cli` the White Hat IQ platform runs as its PDF craft engine
+# (`pdfcraft-cli mcp`, MCP over stdio, WHIQ-CHANGES.md), built for Linux x86_64 (musl, static: the
+# host's glibc does not matter) and Windows x86_64 (static CRT), with craft-fonts embedded at
+# PdfCraft's own pin and the OCR models (ocrs, CC-BY-SA-4.0, pinned by SHA-256 in ATTRIBUTION.toml)
+# shipped beside the binary in models/. The WHIQ contract suite runs against the built binary on
+# both systems before anything is published; the release carries the two archives, SHA256SUMS and
+# engines.lock (the platform's format). No signing, no secrets: the workflow's own GITHUB_TOKEN
+# publishes. The upstream release.yml is untouched.
+#
+# A published asset is never replaced (the platform pins each by sha256 in engines.lock), a
+# dispatch naming a tag that already exists builds that tag, and the archives are reproducible.
+#
+#   Actions › whiq-release › Run workflow (tag: whiq-v0.1.0)     # build, test and publish
+#   (empty tag: build and test only)
+
+on:
+  push:
+    tags: ["whiq-v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish, e.g. whiq-v0.1.0 (empty: build and test only)"
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: whiq-release-${{ github.ref }}-${{ inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  APP: pdfcraft
+  # PdfCraft's own craft-fonts pin (release.yml, ci.yml): its fonts build script reads that
+  # revision's manifests (Arabic, Hebrew, Thai, Devanagari, Japanese, Chinese faces).
+  CRAFT_FONTS_REF: b076417b5880bd4154bd22f00695b1d28c6bea83
+  CRAFT_FONTS_REQUIRED: "1"
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  plan:
+    runs-on: ubuntu-22.04
+    outputs:
+      ref: ${{ steps.ref.outputs.ref }}
+    steps:
+      - id: ref
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          tag="${{ inputs.tag || github.ref_name }}"
+          if [ "${{ github.ref_type }}" != "tag" ] && [ -n "${{ inputs.tag }}" ] && gh api "repos/$GH_REPO/git/ref/tags/$tag" >/dev/null 2>&1; then
+            echo "ref=refs/tags/$tag" >> "$GITHUB_OUTPUT"; echo "building the existing tag $tag"
+          else
+            echo "ref=$GITHUB_SHA" >> "$GITHUB_OUTPUT"; echo "building $GITHUB_SHA"
+          fi
+
+  build:
+    name: build (${{ matrix.platform }})
+    needs: plan
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+            exe: ""
+          - platform: windows-x86_64
+            os: windows-2022
+            target: x86_64-pc-windows-msvc
+            exe: ".exe"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.ref }}
+      - name: Check out craft-fonts at the pin
+        uses: actions/checkout@v4
+        with:
+          repository: storytold/craft-fonts
+          ref: ${{ env.CRAFT_FONTS_REF }}
+          path: craft-fonts
+      - name: musl toolchain (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools cmake
+      - name: NASM (Windows, aws-lc)
+        if: runner.os == 'Windows'
+        uses: ilammy/setup-nasm@v1
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: whiq-release-${{ matrix.target }}
+      - name: OCR models (pinned by SHA-256 in ATTRIBUTION.toml)
+        shell: bash
+        run: |
+          mkdir -p assets/models
+          fetch() {
+            curl -fsSL --retry 5 -o "assets/models/$1" "https://ocrs-models.s3-accelerate.amazonaws.com/$1"
+            got="$( (sha256sum "assets/models/$1" 2>/dev/null || shasum -a 256 "assets/models/$1") | cut -d' ' -f1)"
+            [ "$got" = "$2" ] || { echo "::error::$1 sha256 $got, expected $2"; exit 1; }
+          }
+          fetch text-detection.onnx a917b23dbd9524b465df7e922641b3ff2981623df4ded5a0234004ef2fee7cfe
+          fetch text-recognition.onnx 86c145c2edb96c8caed5b1ebb8f44d706408922211451c309c625157dd6061c5
+      - name: Release tag
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then tag="${{ github.ref_name }}";
+          elif [ -n "${{ inputs.tag }}" ]; then tag="${{ inputs.tag }}";
+          else tag="whiq-dev-$(git rev-parse --short=7 HEAD)"; fi
+          case "$tag" in whiq-v*|whiq-dev-*) ;; *) echo "::error::release tags start with whiq-v (got $tag)"; exit 1;; esac
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      - name: Build ${{ env.APP }}-cli
+        shell: bash
+        env:
+          CRAFT_FONTS_DIR: ${{ github.workspace }}/craft-fonts
+          RUSTFLAGS: ${{ runner.os == 'Windows' && '-C target-feature=+crt-static' || '' }}
+        run: cargo build --release --locked -p "$APP-cli" --target "${{ matrix.target }}"
+      - name: Models beside the binary
+        shell: bash
+        run: |
+          mkdir -p "target/${{ matrix.target }}/release/models"
+          cp assets/models/*.onnx "target/${{ matrix.target }}/release/models/"
+      - name: WHIQ contract suite against the built binary
+        shell: bash
+        env:
+          CRAFT_FONTS_DIR: ${{ github.workspace }}/craft-fonts
+          RUSTFLAGS: ${{ runner.os == 'Windows' && '-C target-feature=+crt-static' || '' }}
+        run: |
+          ROOT="$PWD"; if [ "$RUNNER_OS" = "Windows" ]; then ROOT="$(pwd -W)"; fi
+          BIN="$ROOT/target/${{ matrix.target }}/release/$APP-cli${{ matrix.exe }}"
+          PDFCRAFT_CLI="$BIN" cargo test --release --locked -p "$APP-cli" --target "${{ matrix.target }}" --test whiq -- --test-threads 2
+      - name: Static binary (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          BIN="$PWD/target/${{ matrix.target }}/release/$APP-cli"
+          file "$BIN" | tee /dev/stderr | grep -Eq "statically linked|static-pie linked"
+          "$BIN" --version
+      - name: Package
+        shell: bash
+        run: |
+          tag="${{ steps.tag.outputs.tag }}"
+          name="$APP-cli-$tag-${{ matrix.platform }}"
+          mkdir -p "dist/$name/licenses/fonts" "dist/$name/models"
+          cp "target/${{ matrix.target }}/release/$APP-cli${{ matrix.exe }}" "dist/$name/"
+          cp assets/models/*.onnx "dist/$name/models/"
+          cp LICENSE-APACHE LICENSE-MIT NOTICE ATTRIBUTION.md WHIQ-CHANGES.md "dist/$name/"
+          curl -fsSL --retry 5 -o "dist/$name/models/LICENSE-CC-BY-SA-4.0.txt" https://creativecommons.org/licenses/by-sa/4.0/legalcode.txt || echo "CC-BY-SA-4.0: https://creativecommons.org/licenses/by-sa/4.0/legalcode" > "dist/$name/models/LICENSE-CC-BY-SA-4.0.txt"
+          (cd craft-fonts/fonts && for d in */; do for f in "$d"*.txt "$d"LICENSE* "$d"OFL*; do [ -f "$f" ] && mkdir -p "../../dist/$name/licenses/fonts/$d" && cp "$f" "../../dist/$name/licenses/fonts/$d"; done; done; true)
+          printf '%s\n' "$APP-cli $tag (${{ matrix.target }}), craft-fonts $CRAFT_FONTS_REF, ocrs models (ATTRIBUTION.toml), commit $(git rev-parse HEAD)" > "dist/$name/BUILD.txt"
+          epoch="$(git log -1 --format=%ct)"
+          cd dist
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            PY="$(command -v python3 || command -v python)"
+            "$PY" - "$name" "$name.zip" "$epoch" <<'PY'
+          import os, sys, time, zipfile
+          src, out, epoch = sys.argv[1], sys.argv[2], int(sys.argv[3])
+          stamp = time.gmtime(max(epoch, 315532800))[:6]
+          files = []
+          for root, dirs, names in os.walk(src):
+              files += [os.path.join(root, n) for n in names]
+          with zipfile.ZipFile(out, "w") as z:
+              for f in sorted(files, key=lambda p: p.replace(os.sep, "/")):
+                  info = zipfile.ZipInfo(f.replace(os.sep, "/"), date_time=stamp)
+                  info.compress_type = zipfile.ZIP_DEFLATED
+                  info.create_system = 3
+                  info.external_attr = (0o100755 if f.endswith(".exe") else 0o100644) << 16
+                  with open(f, "rb") as fh:
+                      z.writestr(info, fh.read(), compresslevel=9)
+          PY
+          else
+            tar --sort=name --mtime="@$epoch" --owner=0 --group=0 --numeric-owner -cf - "$name" | gzip -n > "$name.tar.gz"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP }}-cli-${{ matrix.platform }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          if-no-files-found: error
+
+  release:
+    name: publish
+    needs: [plan, build]
+    if: github.ref_type == 'tag' || inputs.tag != ''
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.ref }}
+          path: src
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: SHA256SUMS and engines.lock
+        shell: bash
+        run: |
+          tag="${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}"
+          cd dist
+          sha256sum "$APP-cli-$tag-linux-x86_64.tar.gz" "$APP-cli-$tag-windows-x86_64.zip" > SHA256SUMS
+          cat SHA256SUMS
+          python3 - "$APP" "$tag" > engines.lock <<'PY'
+          import json, sys
+          app, tag = sys.argv[1], sys.argv[2]
+          rows = [line.split() for line in open("SHA256SUMS")]
+          print(json.dumps([{"app": app, "tag": tag, "file": f, "sha256": h} for h, f in rows], indent=2))
+          PY
+          cat engines.lock
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          tag="${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}"
+          notes="Headless PdfCraft ($APP-cli) for the White Hat IQ platform: the PDF craft engine, MCP over stdio (pdfcraft-cli mcp). Linux x86_64 (musl, static) and Windows x86_64. craft-fonts $CRAFT_FONTS_REF embedded; OCR models in models/ beside the binary. Contract and tools: WHIQ-CHANGES.md in each archive. Checksums: SHA256SUMS; engines.lock for the platform build."
+          commit="$(git -C src rev-parse HEAD)"
+          cd dist
+          draft=true
+          if gh release view "$tag" >/dev/null 2>&1; then
+            draft="$(gh release view "$tag" --json isDraft --jq .isDraft)"
+            n="$(gh release view "$tag" --json assets --jq '.assets | length')"
+            if [ "$draft" != "true" ] && [ "$n" != "0" ]; then
+              echo "::error::release $tag already has $n file(s); a published release is never overwritten: publish a new tag"
+              exit 1
+            fi
+          else
+            gh release create "$tag" --draft --target "$commit" --title "$APP-cli $tag" --notes "$notes"
+          fi
+          rid="$(gh release view "$tag" --json databaseId --jq .databaseId)"
+          upload() {
+            local f="$1" want size try got aid state asize adigest
+            want="sha256:$(sha256sum "$f" | cut -d' ' -f1)"; size="$(stat -c %s "$f")"
+            for try in 1 2 3 4 5; do
+              got="$(gh api "repos/$GH_REPO/releases/$rid/assets" --paginate --jq ".[] | select(.name == \"$f\") | \"\(.id) \(.state) \(.size) \(.digest // \"-\")\"")" || got=""
+              if [ -n "$got" ]; then
+                read -r aid state asize adigest <<<"$got"
+                if [ "$state" = uploaded ] && [ "$asize" = "$size" ] && { [ "$adigest" = "-" ] || [ "$adigest" = "$want" ]; }; then
+                  echo "$f is on the release ($want)"; return 0
+                fi
+                if [ "$draft" != "true" ]; then
+                  echo "::error::$f on the published release $tag is not this file; it is never replaced: publish a new tag"; return 1
+                fi
+                echo "removing an incomplete $f from the draft ($state, $asize bytes)"
+                gh api -X DELETE "repos/$GH_REPO/releases/assets/$aid"
+              fi
+              [ "$try" = 5 ] && break
+              if ! gh release upload "$tag" "$f"; then
+                echo "upload of $f failed (attempt $try); checking what reached the release"
+                sleep $((try * 15))
+              fi
+            done
+            echo "::error::$f could not be uploaded"; return 1
+          }
+          for f in ./*.tar.gz ./*.zip SHA256SUMS engines.lock; do upload "${f#./}"; done
+          if [ "$draft" = "true" ]; then
+            gh release edit "$tag" --draft=false --target "$commit"
+          fi
+          gh release view "$tag" --json tagName,isDraft,assets --jq '{tag: .tagName, draft: .isDraft, assets: [.assets[] | {name, size, digest}]}'

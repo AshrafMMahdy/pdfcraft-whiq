@@ -48,6 +48,21 @@ fn add_page(doc: &mut Document, w: f64, h: f64, resources: Dict, content: Option
     Ok(r)
 }
 
+/// Append a page of `width × height` points to `doc`'s page tree, with `resources` and, when given,
+/// `content` as its (Flate-compressed) content stream. Returns the page object. For callers that
+/// lay out pages of their own (Markdown and HTML to PDF).
+pub fn append_page(doc: &mut Document, width: f64, height: f64, resources: Dict, content: Option<Vec<u8>>) -> Result<ObjRef, CreateError> {
+    if !(width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0 && width <= MAX_SIDE && height <= MAX_SIDE) {
+        return Err(CreateError::Invalid(format!("a page must be between 0 and {MAX_SIDE} points on each side")));
+    }
+    add_page(doc, width, height, resources, content)
+}
+
+/// Give `doc` an Info dictionary with `title` (and PdfCraft as its producer).
+pub fn set_document_title(doc: &mut Document, title: &str) {
+    set_title(doc, title);
+}
+
 fn set_title(doc: &mut Document, title: &str) {
     let mut info = Dict::new();
     info.set(b"Title".to_vec(), PdfString::text(title));

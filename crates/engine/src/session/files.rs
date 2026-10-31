@@ -384,6 +384,12 @@ impl Session {
 
     /// A new file (Combine, Extract, Split, Create) as bytes, checked like a save before anyone
     /// writes it (#1698, #2166): it reopens, and shows the pages it was built from.
+    /// A document a caller built itself (Markdown or HTML to PDF), written and checked as every new
+    /// document is: it must reopen with all its pages.
+    pub fn create_from_document(&self, doc: &pdfcraft_cos::Document) -> Result<Arc<Vec<u8>>, EditError> {
+        self.write_new(doc)
+    }
+
     fn write_new(&self, doc: &pdfcraft_cos::Document) -> Result<Arc<Vec<u8>>, EditError> {
         let bytes = self.write_unchecked(doc)?;
         let expected = pdfcraft_organize::page_count(doc)?;
