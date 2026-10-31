@@ -458,6 +458,81 @@ fn scanned_pages_are_read_by_ocr_and_ocr_makes_them_searchable() {
     assert_eq!(found["count"], json!(1), "{found}");
 }
 
+/// The Arabic model too: beside the binary, `PDFCRAFT_MODELS`, or the source tree's models/.
+fn arabic_model_present() -> bool {
+    let at = |d: &Path| d.join("arabic-recognition.onnx").exists() && d.join("arabic-recognition.txt").exists();
+    let beside = bin().parent().is_some_and(|d| at(&d.join("models")));
+    let env = std::env::var_os("PDFCRAFT_MODELS").is_some_and(|d| at(Path::new(&d)));
+    beside || env || at(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models"))
+}
+
+/// An Arabic scan with Latin words and numbers in it: read by OCR in typed order (right to left,
+/// the Latin and the numbers left to right where they stand), and `ocr` makes it searchable in
+/// Arabic.
+#[test]
+fn arabic_scans_are_read_in_typed_order_and_ocr_makes_them_searchable() {
+    if !models_present() || !arabic_model_present() {
+        eprintln!("skipped: no OCR models with the Arabic model (cargo xtask models; models/)");
+        return;
+    }
+    let mut s = Server::start(&[]);
+    let st = s.ok("server_status", json!({}));
+    if st["fonts"]["arabic"] != json!(true) {
+        eprintln!("skipped: this build has no craft-fonts Arabic face to draw the scan with (CRAFT_FONTS_DIR)");
+        return;
+    }
+    assert!(st["ocr"]["languages"].as_str().unwrap().contains("Arabic"), "{st}");
+    let md =
+        "# تقرير الموقع اليومي\n\nتم صب الخرسانة للطابق الثالث بمقاومة C30 بعد فحص الشدات.\n\nبلغت نسبة الإنجاز 47 بالمائة حسب البرنامج الزمني.\n";
+    let r = s.ok("convert", json!({"markdown": md, "path": "src.pdf", "font_size": 16}));
+    let shot = s.ok("render_preview", json!({"document": r["document"], "format": "png", "dpi": 200, "out_dir": "scan"}));
+    let png = PathBuf::from(shot["pages"][0]["path"].as_str().unwrap());
+    std::fs::copy(&png, s.inp().join("scan.png")).unwrap();
+    let scan = s.ok("convert", json!({"inputs": ["scan.png"], "path": "scan.pdf"}));
+    let read = s.ok("read", json!({"document": scan["document"], "format": "text"}));
+    assert_eq!(read["ocr_pages"], json!([1]), "{read}");
+    let text = read["pages"][0]["text"].as_str().unwrap();
+    let words = [
+        "تقرير",
+        "الموقع",
+        "اليومي",
+        "تم",
+        "صب",
+        "الخرسانة",
+        "للطابق",
+        "الثالث",
+        "بمقاومة",
+        "C30",
+        "بعد",
+        "فحص",
+        "بلغت",
+        "نسبة",
+        "الإنجاز",
+        "47",
+        "حسب",
+        "البرنامج",
+        "الزمني",
+    ];
+    let got: Vec<&str> = text.split(|c: char| !c.is_alphanumeric()).collect();
+    let hits = words.iter().filter(|w| got.contains(w)).count();
+    eprintln!("Arabic OCR word accuracy {hits}/{}: {text}", words.len());
+    assert!(hits * 100 >= words.len() * 85, "OCR read {hits} of {} words: {text}", words.len());
+    // Typed order: the first words come first, the Latin and the number where they belong.
+    let pos = |w: &str| text.find(w).unwrap_or_else(|| panic!("{w} missing in {text}"));
+    assert!(pos("تقرير") < pos("اليومي") && pos("بمقاومة") < pos("C30") && pos("C30") < pos("فحص"), "{text}");
+    assert!(pos("نسبة") < pos("47") && pos("47") < pos("البرنامج"), "{text}");
+    // The searchable PDF holds the Arabic in its text layer, in typed order.
+    let o = s.ok("ocr", json!({"document": scan["document"], "save_to": "scan-searchable.pdf"}));
+    assert!(o["words"].as_u64().unwrap() >= 15, "{o}");
+    let found = s.ok("search", json!({"path": s.out().join("scan-searchable.pdf"), "query": "الخرسانة"}));
+    assert_eq!(found["count"], json!(1), "{found}");
+    let back = s.ok("read", json!({"path": s.out().join("scan-searchable.pdf"), "format": "text", "ocr": "off"}));
+    let layer = back["pages"][0]["text"].as_str().unwrap();
+    assert!(layer.contains("الخرسانة") && layer.contains("C30"), "{layer}");
+    let at = |w: &str| layer.find(w).unwrap_or_else(|| panic!("{w} missing in {layer}"));
+    assert!(at("تم") < at("الخرسانة") && at("الخرسانة") < at("الثالث"), "{layer}");
+}
+
 // ---- search, list, preview -------------------------------------------------------------------
 
 #[test]

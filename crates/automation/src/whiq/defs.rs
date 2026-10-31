@@ -157,7 +157,7 @@ pub fn definitions() -> Vec<Value> {
         tool(
             "read",
             "Read a PDF",
-            "Read pages as structured text, page by page in reading order: headings as #, tables as Markdown pipe tables, paragraphs (format markdown, the default), or plain lines (format text). Pages with no text layer are read by OCR automatically (ocr: auto, the default; off never; force every page) and listed in ocr_pages; OCR reads the Latin alphabet. Every answer carries page_count and the metadata. Windowed: only the pages asked for are laid out; a long answer is cut at --max-result-bytes with continue_from (the next page number) — call again with it. Answers {document, name, page_count, metadata, pages: [{page, text, chars, tables, ocr, ocr_confidence?}], ocr_pages, continue_from?, next_page?}.",
+            "Read pages as structured text, page by page in reading order: headings as #, tables as Markdown pipe tables, paragraphs (format markdown, the default), or plain lines (format text). Pages with no text layer are read by OCR automatically (ocr: auto, the default; off never; force every page) and listed in ocr_pages; OCR reads the Latin alphabet, and Arabic (mixed Arabic and Latin lines included, in typed order) when the Arabic model is installed. Every answer carries page_count and the metadata. Windowed: only the pages asked for are laid out; a long answer is cut at --max-result-bytes with continue_from (the next page number) — call again with it. Answers {document, name, page_count, metadata, pages: [{page, text, chars, tables, ocr, ocr_confidence?}], ocr_pages, continue_from?, next_page?}.",
             obj(
                 json!({
                     "document": document(),
@@ -291,7 +291,7 @@ pub fn definitions() -> Vec<Value> {
         tool(
             "ocr",
             "OCR to a searchable PDF",
-            "Recognise the text of pages (default: every page without a text layer; skip_text_pages: false reads all) and add it as an invisible text layer over the page image, so a scanned PDF becomes searchable and selectable; the picture is unchanged. With save_to the searchable PDF is saved there (else save_document later). Answers {document, pages_read, pages_skipped, words, saved?}. The models read the Latin alphabet.",
+            "Recognise the text of pages (default: every page without a text layer; skip_text_pages: false reads all) and add it as an invisible text layer over the page image, so a scanned PDF becomes searchable and selectable; the picture is unchanged. With save_to the searchable PDF is saved there (else save_document later). Answers {document, pages_read, pages_skipped, words, saved?}. Reads the Latin alphabet, and Arabic (with the Latin words and numbers among it) when the Arabic model is installed beside the binary, telling them apart line by line with no setting; Arabic is stored in typed order.",
             obj(
                 json!({
                     "document": document(),

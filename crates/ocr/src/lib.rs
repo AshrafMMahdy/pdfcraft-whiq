@@ -6,13 +6,23 @@
 //! into page content: invisible text (rendering mode 3) over each word, so the page becomes a
 //! searchable image (Acrobat's "Searchable Image (Exact)": the image is left untouched).
 //!
-//! The models read the Latin alphabet (English and other languages written without accents).
+//! The ocrs models read the Latin alphabet (English and other languages written without
+//! accents). When the Arabic model is installed beside them (`models/`, PaddleOCR's Arabic
+//! text-line recogniser, Apache-2.0; see [`arabic`]), every line ocrs finds is also read by it,
+//! and a line in Arabic script takes that reading: Arabic and Latin both read with no setting,
+//! line by line, mixed lines included. Arabic lines come out in logical (typed) order.
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 use std::path::{Path, PathBuf};
 
 pub use pdfcraft_fonts::helvetica_width;
+
+pub mod arabic;
+pub mod bidi;
+
+pub use arabic::{ARABIC_CHARSET, ARABIC_MODEL};
+pub use bidi::visual_word;
 
 /// The model files, as named in ATTRIBUTION.toml.
 pub const DETECTION_MODEL: &str = "text-detection.onnx";
@@ -23,8 +33,9 @@ pub const RECOGNITION_MODEL: &str = "text-recognition.onnx";
 /// `€`, which made a scanned "€250" read as "E250".
 pub const ALPHABET: &str = " 0123456789!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~€ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
-/// The languages the models read (ISO 639-1); all use the Latin alphabet without accents.
-pub const LANGUAGES: &[(&str, &str)] = &[("en", "English")];
+/// The languages the models read (ISO 639-1): English with the ocrs models, Arabic when the
+/// Arabic model is installed too. Recognition tells them apart line by line on its own.
+pub const LANGUAGES: &[(&str, &str)] = &[("en", "English"), ("ar", "Arabic")];
 
 #[derive(Debug, thiserror::Error)]
 pub enum OcrError {
@@ -73,6 +84,7 @@ impl Models {
             dirs.extend(Self::dirs_beside_exe(&exe));
         }
         dirs.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/models"));
+        dirs.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models"));
         dirs
     }
 
@@ -87,6 +99,37 @@ impl Models {
     }
 }
 
+/// Where the Arabic model and its character list are.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ArabicFiles {
+    pub model: PathBuf,
+    pub charset: PathBuf,
+}
+
+impl ArabicFiles {
+    pub fn in_dir(dir: &Path) -> Option<ArabicFiles> {
+        let f = ArabicFiles { model: dir.join(ARABIC_MODEL), charset: dir.join(ARABIC_CHARSET) };
+        (f.model.is_file() && f.charset.is_file()).then_some(f)
+    }
+
+    /// Look in the same places as [`Models::find`]. `PDFCRAFT_OCR_ARABIC=0` turns Arabic off.
+    pub fn find() -> Option<ArabicFiles> {
+        if std::env::var_os("PDFCRAFT_OCR_ARABIC").is_some_and(|v| v == "0") {
+            return None;
+        }
+        Models::search_dirs().iter().find_map(|d| Self::in_dir(d))
+    }
+}
+
+/// What the installed models read, for status reports.
+pub fn languages_installed() -> &'static str {
+    match (Models::find().is_some(), ArabicFiles::find().is_some()) {
+        (true, true) => "Latin alphabet (en) and Arabic (ar), detected per line",
+        (true, false) => "Latin alphabet (en)",
+        _ => "none",
+    }
+}
+
 /// A recognised word: its text and its box in image pixels `[left, top, right, bottom]`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Word {
@@ -94,25 +137,47 @@ pub struct Word {
     pub rect: [f32; 4],
 }
 
-/// A recognised line of words, in reading order.
+/// A recognised line of words, in reading (logical) order: right to left for an Arabic line,
+/// each word's text in typed order.
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct Line {
     pub words: Vec<Word>,
+    /// Whether the line reads right to left (an Arabic line).
+    pub rtl: bool,
 }
 
 impl Line {
     pub fn text(&self) -> String {
         self.words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ")
     }
+
+    /// The words left to right as they stand on the page (a line with Arabic in it is in typed
+    /// order, which runs right to left through the Arabic).
+    pub fn words_left_to_right(&self) -> Vec<&Word> {
+        let mut words: Vec<&Word> = self.words.iter().collect();
+        if self.rtl || words.iter().any(|w| w.text.chars().any(bidi::is_rtl)) {
+            words.sort_by(|a, b| a.rect[0].total_cmp(&b.rect[0]));
+        }
+        words
+    }
 }
 
 /// A loaded recogniser. Loading takes a moment; keep one and reuse it.
 pub struct Ocr {
     engine: ocrs::OcrEngine,
+    arabic: Option<arabic::ArabicModel>,
 }
 
 impl Ocr {
+    /// Load the ocrs models, and the Arabic model when it is installed (beside them first)
+    /// and not turned off ([`ArabicFiles::find`]).
     pub fn load(models: &Models) -> Result<Ocr, OcrError> {
+        let arabic = ArabicFiles::find().map(|found| models.detection.parent().and_then(ArabicFiles::in_dir).unwrap_or(found));
+        Self::load_with(models, arabic.as_ref())
+    }
+
+    /// Load the ocrs models and, if given, the Arabic model.
+    pub fn load_with(models: &Models, arabic: Option<&ArabicFiles>) -> Result<Ocr, OcrError> {
         let load = |p: &Path| rten::Model::load_file(p).map_err(|e| OcrError::Load(p.display().to_string(), e.to_string()));
         let params = ocrs::OcrEngineParams {
             detection_model: Some(load(&models.detection)?),
@@ -121,7 +186,13 @@ impl Ocr {
             ..Default::default()
         };
         let engine = ocrs::OcrEngine::new(params).map_err(|e| OcrError::Load("ocr engine".into(), e.to_string()))?;
-        Ok(Ocr { engine })
+        let arabic = arabic.map(|f| arabic::ArabicModel::load(&f.model, &f.charset)).transpose()?;
+        Ok(Ocr { engine, arabic })
+    }
+
+    /// Whether this recogniser reads Arabic as well as Latin.
+    pub fn reads_arabic(&self) -> bool {
+        self.arabic.is_some()
     }
 
     /// Load the models found by [`Models::find`].
@@ -146,24 +217,117 @@ impl Ocr {
         let found = self.engine.detect_words(&input).map_err(|e| err(&e))?;
         let lines = self.engine.find_text_lines(&input, &found);
         let read = self.engine.recognize_text(&input, &lines).map_err(|e| err(&e))?;
-        use ocrs::TextItem;
-        Ok(read
-            .into_iter()
-            .flatten()
-            .map(|line| Line {
-                words: line
-                    .words()
-                    .map(|w| {
-                        let r = w.bounding_rect();
-                        Word { text: w.to_string(), rect: [r.left() as f32, r.top() as f32, r.right() as f32, r.bottom() as f32] }
-                    })
-                    .filter(|w| !w.text.trim().is_empty())
-                    .collect(),
-            })
-            .filter(|l| !l.words.is_empty())
-            .collect())
+        let mut out: Vec<Line> = read.iter().map(|line| line.as_ref().map(latin_line).unwrap_or_default()).collect();
+        let Some(model) = &self.arabic else {
+            return Ok(out.into_iter().filter(|l| !l.words.is_empty()).collect());
+        };
+        let grey = luma(&rgb, width, height);
+        let img = arabic::Grey { px: &grey, width: width as usize, height: height as usize };
+        for (slot, verdict) in out.iter_mut().zip(mixed::read(model, &self.engine, &input, &img, &lines)?) {
+            match verdict {
+                mixed::Verdict::Arabic(line) => *slot = line,
+                // Read unsurely by both models and only a few characters: noise.
+                mixed::Verdict::Unsure if slot.words.iter().map(|w| w.text.chars().count()).sum::<usize>() <= mixed::NOISE_CHARS => {
+                    slot.words.clear()
+                }
+                _ => {}
+            }
+        }
+        let mut out: Vec<Line> = drop_specks(out.into_iter().filter(|l| !l.words.is_empty()).collect());
+        if out.iter().filter(|l| l.rtl).count() * 2 > out.len() {
+            out = rtl_reading_order(out);
+        }
+        Ok(out)
     }
 }
+
+/// Lines no taller than this share of the page's usual line are specks (noise on a scan read
+/// as a letter or two), not text.
+const SPECK: f32 = 0.45;
+
+/// The page's lines without the ones made of specks: every word in them much shorter than the
+/// page's usual word and only a few characters long.
+fn drop_specks(lines: Vec<Line>) -> Vec<Line> {
+    let mut heights: Vec<f32> = lines.iter().flat_map(|l| &l.words).map(|w| w.rect[3] - w.rect[1]).filter(|h| h.is_finite() && *h > 0.0).collect();
+    if heights.len() < 8 {
+        return lines;
+    }
+    heights.sort_by(f32::total_cmp);
+    let usual = heights.get(heights.len() / 2).copied().unwrap_or(0.0);
+    lines
+        .into_iter()
+        .filter(|l| {
+            let tallest = l.words.iter().map(|w| w.rect[3] - w.rect[1]).fold(0.0f32, f32::max);
+            let chars: usize = l.words.iter().map(|w| w.text.chars().count()).sum();
+            tallest >= SPECK * usual || chars > 3
+        })
+        .collect()
+}
+
+/// A right-to-left page's lines in its reading order: rows top to bottom, and the lines side by
+/// side in a row (table cells, a label and its value) right to left. ocrs orders lines for
+/// left-to-right pages, by columns from the left, which puts the short right-aligned last line
+/// of an Arabic paragraph in a column of its own.
+fn rtl_reading_order(lines: Vec<Line>) -> Vec<Line> {
+    let bounds = |l: &Line| {
+        l.words.iter().fold([f32::MAX, f32::MAX, f32::MIN, f32::MIN], |b, w| {
+            [b[0].min(w.rect[0]), b[1].min(w.rect[1]), b[2].max(w.rect[2]), b[3].max(w.rect[3])]
+        })
+    };
+    // A line's height is its words' (on a skewed scan a long line's box is much taller).
+    let height = |l: &Line| {
+        let mut h: Vec<f32> = l.words.iter().map(|w| w.rect[3] - w.rect[1]).collect();
+        h.sort_by(f32::total_cmp);
+        h.get(h.len() / 2).copied().unwrap_or(0.0)
+    };
+    let mut items: Vec<([f32; 4], f32, Line)> = lines.into_iter().map(|l| (bounds(&l), height(&l), l)).collect();
+    let mid = |b: &[f32; 4]| (b[1] + b[3]) / 2.0;
+    items.sort_by(|a, b| mid(&a.0).total_cmp(&mid(&b.0)));
+    let mut rows: Vec<Vec<([f32; 4], f32, Line)>> = Vec::new();
+    for item in items {
+        // A line whose middle is within half a line of the row's first line's is beside it.
+        match rows.last_mut() {
+            Some(row) if row.first().is_some_and(|(b, h, _)| (mid(&item.0) - mid(b)).abs() < 0.5 * h.max(item.1)) => row.push(item),
+            _ => rows.push(vec![item]),
+        }
+    }
+    rows.into_iter()
+        .flat_map(|mut row| {
+            row.sort_by(|a, b| b.0[2].total_cmp(&a.0[2]));
+            row.into_iter().map(|(_, _, l)| l)
+        })
+        .collect()
+}
+
+/// An ocrs line as words.
+fn latin_line(line: &ocrs::TextLine) -> Line {
+    use ocrs::TextItem;
+    Line {
+        words: line
+            .words()
+            .map(|w| {
+                let r = w.bounding_rect();
+                Word { text: w.to_string(), rect: [r.left() as f32, r.top() as f32, r.right() as f32, r.bottom() as f32] }
+            })
+            .filter(|w| !w.text.trim().is_empty())
+            .collect(),
+        rtl: false,
+    }
+}
+
+/// One grey byte per pixel from RGB (or grey) pixels.
+fn luma(px: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let n = (width as usize).saturating_mul(height as usize);
+    if px.len() >= n.saturating_mul(3) {
+        px.as_chunks::<3>().0.iter().take(n).map(|p| ((u32::from(p[0]) * 299 + u32::from(p[1]) * 587 + u32::from(p[2]) * 114) / 1000) as u8).collect()
+    } else {
+        let mut g = px.get(..n).map(<[u8]>::to_vec).unwrap_or_default();
+        g.resize(n, 255);
+        g
+    }
+}
+
+mod mixed;
 
 /// A word placed on a page, in PDF user space: the bottom-left corner of its box, and the
 /// vectors along its bottom edge (`across`, left → right as read) and its left edge (`up`).
@@ -214,40 +378,98 @@ fn num(v: f64) -> String {
     if s == "-0" { "0".into() } else { s.into() }
 }
 
-/// Page content that writes `words` as invisible text in `/PCHelv` (standard Helvetica,
-/// WinAnsiEncoding), each word stretched to its box so selection and search highlight the
-/// right place. Marked content `/OCR` so it can be told apart from the page's own text.
+/// The resource name the text layer gives the font for words Helvetica can't hold (Arabic):
+/// [`pdfcraft_fonts::glyphless`]. Whoever adds the layer to a page adds that font under it.
+pub const UNICODE_FONT: &str = pdfcraft_fonts::glyphless::GLYPHLESS_RESOURCE;
+
+/// Page content that writes `words` as invisible text: in `/PCHelv` (standard Helvetica,
+/// WinAnsiEncoding) when Helvetica can hold the word, else in `/PCOcrU` ([`UNICODE_FONT`], the
+/// glyphless Type0 font: Arabic and any other script). Each word is stretched to its box so
+/// selection and search highlight the right place. Marked content `/OCR` so it can be told apart
+/// from the page's own text. An Arabic word is drawn in visual order ([`visual_word`]), as PDF
+/// producers draw right-to-left text, so text extraction (which reorders right-to-left runs)
+/// gives it back in typed order.
 pub fn text_layer(words: &[PlacedWord]) -> Vec<u8> {
     // `3 Tr` and the font are graphics state, which `ET` doesn't reset: without `q … Q` they
     // would stay set for every later content stream on the page, so text added after OCR (a
     // header or footer) drew invisibly (#3029).
     let mut out = b"/OCR BMC\nq\nBT\n3 Tr\n/PCHelv 1 Tf\n".to_vec();
+    // Words in the order given (each line left to right), switching fonts as needed: extraction
+    // follows the drawing order within a line.
+    let mut helvetica = true;
     for w in words {
-        let width = helvetica_width(&w.text, 1.0);
-        let height = w.up[0].hypot(w.up[1]);
-        if width <= 0.0 || height <= 0.0 {
+        if w.up[0].hypot(w.up[1]) <= 0.0 {
             continue;
         }
-        // The em square: the word's own ink (cap height or x-height, descenders or not) spans the
-        // box, so the text is as tall as the scanned word; its width is stretched to fit the word.
-        let (top, bottom) = ink_extent(&w.text);
-        let em = [w.up[0] / (top - bottom), w.up[1] / (top - bottom)];
-        let ax = [w.across[0] / width, w.across[1] / width];
-        let o = [w.origin[0] - em[0] * bottom, w.origin[1] - em[1] * bottom];
-        let m = [ax[0], ax[1], em[0], em[1], o[0], o[1]];
-        let nums: Vec<String> = m.iter().map(|v| num(*v)).collect();
-        out.extend_from_slice(nums.join(" ").as_bytes());
-        out.extend_from_slice(b" Tm ");
-        out.extend(pdfcraft_fonts::literal(&pdfcraft_fonts::win_ansi(&w.text)));
-        out.extend_from_slice(b" Tj\n");
+        if pdfcraft_fonts::first_undrawable(&w.text).is_none() {
+            let width = helvetica_width(&w.text, 1.0);
+            if width <= 0.0 {
+                continue;
+            }
+            if !helvetica {
+                out.extend_from_slice(b"/PCHelv 1 Tf\n");
+                helvetica = true;
+            }
+            // The em square: the word's own ink (cap height or x-height, descenders or not)
+            // spans the box, so the text is as tall as the scanned word; its width is stretched
+            // to fit the word.
+            let (top, bottom) = ink_extent(&w.text);
+            write_word(&mut out, w, width, top, bottom, &pdfcraft_fonts::literal(&pdfcraft_fonts::win_ansi(&w.text)));
+        } else {
+            let codes = pdfcraft_fonts::glyphless::glyphless_codes(&visual_word(&w.text));
+            // Every code is one glyph 1 em wide; the box spans the em from its descent to its
+            // ascent.
+            let width = (codes.len() / 2) as f64;
+            if width <= 0.0 {
+                continue;
+            }
+            if helvetica {
+                out.extend_from_slice(format!("/{UNICODE_FONT} 1 Tf\n").as_bytes());
+                helvetica = false;
+            }
+            let hex: String = codes.iter().map(|b| format!("{b:02X}")).collect();
+            write_word(
+                &mut out,
+                w,
+                width,
+                pdfcraft_fonts::glyphless::GLYPHLESS_ASCENT,
+                pdfcraft_fonts::glyphless::GLYPHLESS_DESCENT,
+                format!("<{hex}>").as_bytes(),
+            );
+        }
     }
     out.extend_from_slice(b"ET\nQ\nEMC\n");
     out
 }
 
+/// One word: a text matrix that fits `width` (text space units at size 1) across the word's box
+/// and the span from `bottom` to `top` (em fractions) up it, then the string.
+fn write_word(out: &mut Vec<u8>, w: &PlacedWord, width: f64, top: f64, bottom: f64, string: &[u8]) {
+    let em = [w.up[0] / (top - bottom), w.up[1] / (top - bottom)];
+    let ax = [w.across[0] / width, w.across[1] / width];
+    let o = [w.origin[0] - em[0] * bottom, w.origin[1] - em[1] * bottom];
+    let m = [ax[0], ax[1], em[0], em[1], o[0], o[1]];
+    let nums: Vec<String> = m.iter().map(|v| num(*v)).collect();
+    out.extend_from_slice(nums.join(" ").as_bytes());
+    out.extend_from_slice(b" Tm ");
+    out.extend_from_slice(string);
+    out.extend_from_slice(b" Tj\n");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An Arabic stretch in a Latin line is typed right to left: drawn, its words go left to right.
+    #[test]
+    fn words_are_drawn_left_to_right_whatever_the_typed_order() {
+        let w = |t: &str, x: f32| Word { text: t.into(), rect: [x, 0.0, x + 10.0, 10.0] };
+        let line = Line { words: vec![w("Compound", 0.0), w("مجمع", 60.0), w("النور", 40.0), w("Phase", 80.0)], rtl: false };
+        let order: Vec<&str> = line.words_left_to_right().iter().map(|w| w.text.as_str()).collect();
+        assert_eq!(order, ["Compound", "النور", "مجمع", "Phase"]);
+        let latin = Line { words: vec![w("b", 20.0), w("a", 0.0)], rtl: false };
+        assert_eq!(latin.words_left_to_right()[0].text, "b", "a Latin line keeps ocrs's order");
+    }
 
     #[test]
     fn places_words_through_the_mapping() {
@@ -265,6 +487,20 @@ mod tests {
     #[test]
     fn the_model_alphabet_fits_the_text_layer_font() {
         assert_eq!(pdfcraft_fonts::first_undrawable(ALPHABET), None);
+    }
+
+    /// Arabic goes into the glyphless Unicode font, drawn in visual order, one em per character;
+    /// Latin words on the same page stay in Helvetica.
+    #[test]
+    fn arabic_words_go_into_the_unicode_font() {
+        let ar = PlacedWord { text: "برج".into(), origin: [100.0, 20.0], across: [30.0, 0.0], up: [0.0, 10.0] };
+        let en = PlacedWord { text: "Tower".into(), origin: [10.0, 20.0], across: [40.0, 0.0], up: [0.0, 9.3] };
+        let s = String::from_utf8(text_layer(&[ar, en])).unwrap();
+        // "برج" drawn as "جرب": jeem, reh, beh.
+        assert!(s.contains("/PCOcrU 1 Tf\n10 0 0 10 100 22.5 Tm <062C06310628> Tj"), "{s}");
+        assert_eq!(s.matches("/PCHelv 1 Tf").count(), 2, "Helvetica again after the Arabic word: {s}");
+        assert!(s.contains("(Tower) Tj"), "{s}");
+        assert!(s.find("/PCOcrU").unwrap() < s.find("(Tower)").unwrap(), "words keep their order: {s}");
     }
 
     #[test]

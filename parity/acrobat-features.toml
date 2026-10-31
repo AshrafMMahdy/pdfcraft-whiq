@@ -6605,7 +6605,7 @@ status = "partial"
 commands = ["ocr.recognize"]
 tools = ["ocr_recognize"]
 evidence = ["crates/ui-egui/tests/it/ocr.rs::recognize_text_dialog_adds_searchable_text"]
-notes = "Language choice exists, but the models read only the Latin alphabet without accents (English)."
+notes = "Language choice exists. The ocrs models read only the Latin alphabet without accents (English); with the Arabic model installed (models/arabic-recognition.onnx, PaddleOCR's Arabic recogniser, Apache-2.0; shipped by the WHIQ release, not the web build) Arabic and mixed Arabic/Latin lines are read too, told apart per line whatever the choice says, in typed order (tested on synthetic scans: crates/ocr, apps/pdfcraft-cli/tests/whiq arabic_scans_are_read_in_typed_order_and_ocr_makes_them_searchable). Still missing: accents, CJK, Cyrillic, Hebrew, other scripts."
 
 [[feature]]
 id = "ocr.searchable-image"

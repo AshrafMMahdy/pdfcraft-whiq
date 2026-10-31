@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use pdfcraft_render::{PageInfo, PageRenderer, RenderConfig, RenderRequest, RequestKind};
 
-pub use pdfcraft_ocr::{LANGUAGES, Models, Ocr, OcrError, PlacedWord};
+pub use pdfcraft_ocr::{ArabicFiles, LANGUAGES, Models, Ocr, OcrError, PlacedWord, languages_installed};
 
 use crate::{DocId, Edit, EditError, Session};
 
@@ -18,7 +18,8 @@ use crate::{DocId, Edit, EditError, Session};
 pub struct OcrSettings {
     /// Resolution pages are rendered at for recognition (Acrobat's "Downsample to" choices).
     pub dpi: f32,
-    /// Language code from [`LANGUAGES`] (the models read the Latin alphabet, whatever this says).
+    /// Language code from [`LANGUAGES`]. Informational: recognition reads Latin, and Arabic when
+    /// its model is installed, telling them apart line by line whatever this says.
     pub language: String,
     /// Leave pages that already have text alone (Acrobat reports "page contains renderable
     /// text" and skips them). When `false`, such pages are read too (a picture on a page that
@@ -149,8 +150,10 @@ impl OcrJob {
                 [u as f64, v as f64]
             };
             // Words the page's own text already has are not added a second time.
+            // Each line's words left to right as they stand (the order a page draws them in, which
+            // text extraction expects for right-to-left lines too).
             let (fresh, already): (Vec<_>, Vec<_>) =
-                lines.iter().flat_map(|l| &l.words).partition(|w| covered(w.rect.map(|v| v / scale), &existing) < ALREADY_ON_PAGE);
+                lines.iter().flat_map(|l| l.words_left_to_right()).partition(|w| covered(w.rect.map(|v| v / scale), &existing) < ALREADY_ON_PAGE);
             let words = fresh.into_iter().map(|w| PlacedWord::place(w, to_user)).collect();
             out.push(OcrPage { page, words, already_on_page: already.len(), skipped: None });
         }

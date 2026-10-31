@@ -387,8 +387,54 @@ pub fn stamp(doc: &mut Document, page: usize, tag: &str, content: Vec<u8>) -> Re
     check(&[page], all.len())?;
     check_on_top(doc, &all[page])?;
     add_resources(doc, &all[page], None, Some(&content))?;
+    let content = add_glyphless(doc, page, content)?;
     let p = page_list(doc).swap_remove(page);
     place_tagged(doc, &p, tag, content, false)
+}
+
+/// When `content` draws with the glyphless Unicode font (an OCR text layer over Arabic), add it
+/// to the page's own resources: one font object for the whole document, under
+/// [`GLYPHLESS_RESOURCE`] or, when the page already uses that name for another font, a free one
+/// (and `content` is renamed to match).
+fn add_glyphless(doc: &mut Document, page: usize, content: Vec<u8>) -> Result<Vec<u8>, EditError> {
+    use pdfcraft_fonts::glyphless::{GLYPHLESS_RESOURCE, add_glyphless_font, is_glyphless_font};
+    let selector = format!("/{GLYPHLESS_RESOURCE} 1 Tf");
+    if !content.windows(selector.len()).any(|w| w == selector.as_bytes()) {
+        return Ok(content);
+    }
+    let pages = page_list(doc);
+    let Some(p) = pages.get(page) else { return Err(EditError::NoSuchPage(page)) };
+    let mut fonts = page_fonts(doc, p);
+    let usable = |fonts: &Dict, name: &str| fonts.get(name.as_bytes()).is_none_or(|f| is_glyphless_font(doc, f));
+    let name = std::iter::once(GLYPHLESS_RESOURCE.to_string())
+        .chain((1..=fonts.len().saturating_add(1)).map(|k| format!("{GLYPHLESS_RESOURCE}_{k}")))
+        .find(|n| usable(&fonts, n))
+        .unwrap_or_else(|| GLYPHLESS_RESOURCE.to_string());
+    if fonts.get(name.as_bytes()).is_none() {
+        // The font another page's layer already added, else a new one.
+        let existing = pages.iter().flat_map(|q| page_fonts(doc, q).iter().map(|(_, v)| v.clone()).collect::<Vec<_>>()).find_map(|f| match f {
+            Object::Ref(r) if is_glyphless_font(doc, &f) => Some(r),
+            _ => None,
+        });
+        let font = existing.unwrap_or_else(|| add_glyphless_font(doc));
+        fonts.set(name.as_bytes().to_vec(), Object::Ref(font));
+        let mut res = p.dict.get(b"Resources").map(|r| doc.resolve(r)).and_then(|r| r.as_dict().cloned()).unwrap_or_default();
+        res.set(b"Font".to_vec(), Object::Dict(fonts));
+        doc.update_dict(p.obj, |d| d.set(b"Resources".to_vec(), Object::Dict(res)))?;
+    }
+    if name == GLYPHLESS_RESOURCE {
+        return Ok(content);
+    }
+    let renamed = format!("/{name} 1 Tf");
+    let mut out = Vec::with_capacity(content.len());
+    let mut rest = content.as_slice();
+    while let Some(at) = rest.windows(selector.len()).position(|w| w == selector.as_bytes()) {
+        out.extend_from_slice(rest.get(..at).unwrap_or_default());
+        out.extend_from_slice(renamed.as_bytes());
+        rest = rest.get(at + selector.len()..).unwrap_or_default();
+    }
+    out.extend_from_slice(rest);
+    Ok(out)
 }
 
 pub(crate) fn begin(kind: MarkKind, subtype: &str, matrix: [f64; 6]) -> String {

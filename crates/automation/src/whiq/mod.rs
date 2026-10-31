@@ -729,7 +729,7 @@ fn server_status(shared: &Shared) -> Value {
         "author": s.author,
         "memory": {"rss_bytes": rss_bytes(), "committed_bytes": committed_bytes(), "limit_bytes": s.max_memory_mb.map(|m| m * 1024 * 1024), "measured": rss_bytes().is_some(), "source": memory_source()},
         "fonts": {"source": "craft-fonts", "faces": faces, "families": families, "default": "Helvetica (standard 14)", "arabic": pdfcraft_fonts::document_arabic_font().is_some()},
-        "ocr": {"models": pdfcraft_engine::ocr::available(), "languages": "Latin alphabet (en)", "search_dirs": pdfcraft_engine::ocr::Models::search_dirs().iter().map(|d| d.to_string_lossy().into_owned()).collect::<Vec<_>>()},
+        "ocr": {"models": pdfcraft_engine::ocr::available(), "languages": pdfcraft_engine::ocr::languages_installed(), "search_dirs": pdfcraft_engine::ocr::Models::search_dirs().iter().map(|d| d.to_string_lossy().into_owned()).collect::<Vec<_>>()},
         "roots": {"read": s.read_root, "write": s.write_root},
         "documents": snap.get("documents").cloned().unwrap_or(json!([])),
         "current_call": current,

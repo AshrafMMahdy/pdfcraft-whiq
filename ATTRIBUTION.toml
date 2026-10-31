@@ -3381,6 +3381,28 @@ kind = "model"
 usage = "Scan & OCR: reads the words it finds (cargo xtask models)"
 sha256 = "86c145c2edb96c8caed5b1ebb8f44d706408922211451c309c625157dd6061c5"
 
+[[asset]]
+path = "models/arabic-recognition.onnx"
+title = "PaddleOCR Arabic text-line recognition model (arabic_PP-OCRv5_mobile_rec), ONNX"
+author = "The PaddlePaddle Authors (PaddleOCR)"
+source = "https://huggingface.co/PaddlePaddle/arabic_PP-OCRv5_mobile_rec at commit 33d91636a65dca87f5562cc48860332ae367ee1b (inference.json, inference.pdiparams; model card licence apache-2.0), converted to ONNX unchanged with paddle2onnx 2.1.0 (opset 14) on paddlepaddle 3.0.0"
+licence = "Apache-2.0"
+licence_file = "LICENSE-APACHE"
+kind = "model"
+usage = "Scan & OCR: reads Arabic text lines, and the Latin words and numbers among them (crates/ocr/src/arabic.rs); shipped beside the binary in models/"
+sha256 = "55841e0f5adc377112e11718855b81039468d8f8580248262be61fc8887d11a2"
+
+[[asset]]
+path = "models/arabic-recognition.txt"
+title = "Character list of the PaddleOCR Arabic text-line recognition model"
+author = "The PaddlePaddle Authors (PaddleOCR)"
+source = "PostProcess.character_dict of inference.yml in https://huggingface.co/PaddlePaddle/arabic_PP-OCRv5_mobile_rec at commit 33d91636a65dca87f5562cc48860332ae367ee1b, one entry per line, unchanged"
+licence = "Apache-2.0"
+licence_file = "LICENSE-APACHE"
+kind = "model"
+usage = "Scan & OCR: the Arabic model's output classes in order (crates/ocr/src/arabic.rs); shipped beside the model"
+sha256 = "7f92f7dbb9b75a4787a83bfb4f6d14a8ab515525130c9d40a9036f61cf6999e9"
+
 [[build_input]]
 name = "craft-fonts"
 option = "CRAFT_FONTS_DIR"

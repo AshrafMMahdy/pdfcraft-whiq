@@ -3,10 +3,10 @@ name: whiq-release
 # WHIQ fork: the headless `pdfcraft-cli` the White Hat IQ platform runs as its PDF craft engine
 # (`pdfcraft-cli mcp`, MCP over stdio, WHIQ-CHANGES.md), built for Linux x86_64 (musl, static: the
 # host's glibc does not matter) and Windows x86_64 (static CRT), with craft-fonts embedded at
-# PdfCraft's own pin and the OCR models (ocrs, CC-BY-SA-4.0, pinned by SHA-256 in ATTRIBUTION.toml)
-# shipped beside the binary in models/. The WHIQ contract suite runs against the built binary on
-# both systems before anything is published; the release carries the two archives, SHA256SUMS and
-# engines.lock (the platform's format). No signing, no secrets: the workflow's own GITHUB_TOKEN
+# PdfCraft's own pin and the OCR models (ocrs, CC-BY-SA-4.0, pinned by SHA-256 in ATTRIBUTION.toml;
+# the Arabic model, Apache-2.0, committed in models/) shipped beside the binary in models/. The
+# WHIQ contract suite runs against the built binary on both systems before anything is published;
+# the release carries the two archives, SHA256SUMS and engines.lock (the platform's format). No signing, no secrets: the workflow's own GITHUB_TOKEN
 # publishes. The upstream release.yml is untouched.
 #
 # A published asset is never replaced (the platform pins each by sha256 in engines.lock), a
@@ -131,7 +131,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p "target/${{ matrix.target }}/release/models"
-          cp assets/models/*.onnx "target/${{ matrix.target }}/release/models/"
+          cp assets/models/*.onnx models/arabic-recognition.onnx models/arabic-recognition.txt "target/${{ matrix.target }}/release/models/"
       - name: WHIQ contract suite against the built binary
         shell: bash
         env:
@@ -155,11 +155,12 @@ jobs:
           name="$APP-cli-$tag-${{ matrix.platform }}"
           mkdir -p "dist/$name/licenses/fonts" "dist/$name/models"
           cp "target/${{ matrix.target }}/release/$APP-cli${{ matrix.exe }}" "dist/$name/"
-          cp assets/models/*.onnx "dist/$name/models/"
+          cp assets/models/*.onnx models/arabic-recognition.onnx models/arabic-recognition.txt "dist/$name/models/"
+          cp LICENSE-APACHE "dist/$name/models/LICENSE-APACHE-2.0.txt"
           cp LICENSE-APACHE LICENSE-MIT NOTICE ATTRIBUTION.md WHIQ-CHANGES.md "dist/$name/"
           curl -fsSL --retry 5 -o "dist/$name/models/LICENSE-CC-BY-SA-4.0.txt" https://creativecommons.org/licenses/by-sa/4.0/legalcode.txt || echo "CC-BY-SA-4.0: https://creativecommons.org/licenses/by-sa/4.0/legalcode" > "dist/$name/models/LICENSE-CC-BY-SA-4.0.txt"
           (cd craft-fonts/fonts && for d in */; do for f in "$d"*.txt "$d"LICENSE* "$d"OFL*; do [ -f "$f" ] && mkdir -p "../../dist/$name/licenses/fonts/$d" && cp "$f" "../../dist/$name/licenses/fonts/$d"; done; done; true)
-          printf '%s\n' "$APP-cli $tag (${{ matrix.target }}), craft-fonts $CRAFT_FONTS_REF, ocrs models (ATTRIBUTION.toml), commit $(git rev-parse HEAD)" > "dist/$name/BUILD.txt"
+          printf '%s\n' "$APP-cli $tag (${{ matrix.target }}), craft-fonts $CRAFT_FONTS_REF, ocrs models and the Arabic model (ATTRIBUTION.toml), commit $(git rev-parse HEAD)" > "dist/$name/BUILD.txt"
           epoch="$(git log -1 --format=%ct)"
           cd dist
           if [ "${{ runner.os }}" = "Windows" ]; then

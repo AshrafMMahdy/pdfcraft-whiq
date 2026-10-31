@@ -167,6 +167,9 @@ pub fn ocr_page(e: &mut Engine, id: u64, p: usize, dpi: f64) -> Res<String> {
             })
         })
         .collect();
+    // A right-to-left (Arabic) page reads its columns and side-by-side lines from the right.
+    let rects: Vec<[f64; 4]> =
+        if lines.iter().filter(|l| l.rtl).count() * 2 > lines.len() { rects.iter().map(|r| [-r[2], r[1], -r[0], r[3]]).collect() } else { rects };
     let order = pdfcraft_export::reading_order(&rects);
     Ok(order.iter().filter_map(|&i| lines.get(i)).map(|l| l.text()).collect::<Vec<_>>().join("\n"))
 }
@@ -196,6 +199,13 @@ fn ordered_text(t: &pdfcraft_render::PageText) -> String {
             })
         })
         .collect();
+    // A right-to-left (Arabic, Hebrew) page reads its columns from the right.
+    let rtl = |s: &str| {
+        let r = s.chars().filter(|c| matches!(u32::from(*c), 0x0590..=0x08FF | 0xFB1D..=0xFDFF | 0xFE70..=0xFEFC) && c.is_alphabetic()).count();
+        r > s.chars().filter(|c| c.is_ascii_alphabetic()).count()
+    };
+    let rtl_lines = ranges.iter().filter(|&&(a, b)| rtl(&t.text_of(a..b))).count();
+    let rects: Vec<[f64; 4]> = if rtl_lines * 2 > ranges.len() { rects.iter().map(|r| [-r[2], r[1], -r[0], r[3]]).collect() } else { rects };
     let order = pdfcraft_export::reading_order(&rects);
     order.iter().filter_map(|&k| ranges.get(k)).map(|&(a, b)| t.text_of(a..b)).collect::<Vec<_>>().join("\n")
 }
