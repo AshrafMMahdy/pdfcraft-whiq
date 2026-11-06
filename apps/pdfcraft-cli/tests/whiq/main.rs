@@ -858,8 +858,17 @@ fn checkpoints_write_the_recovered_file_while_editing() {
 const HOOKS: [(&str, &str); 1] = [("PDFCRAFT_MCP_TEST_HOOKS", "1")];
 
 /// The recovered files in the write root.
+/// Finished ones only: an atomic write's staging file (`.<name>.<tag>.pdfcraft-tmp`) is not one.
 fn recovered_files(s: &Server) -> Vec<PathBuf> {
-    std::fs::read_dir(s.out()).unwrap().flatten().map(|e| e.path()).filter(|p| p.to_string_lossy().contains(".recovered-")).collect()
+    std::fs::read_dir(s.out())
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            name.contains(".recovered-") && name.ends_with(".pdf") && !name.starts_with('.')
+        })
+        .collect()
 }
 
 /// Wait up to `ms` for a recovered file to appear.
@@ -923,6 +932,13 @@ fn the_checkpoint_timer_saves_while_a_long_call_runs() {
     let st = s.ok("server_status", json!({}));
     let listed = Path::new(st["checkpoints"]["files"][0]["path"].as_str().unwrap()).file_name().map(|n| n.to_owned());
     assert_eq!(listed.as_deref(), rec.file_name(), "{st}");
+    // A whole PDF on disk already, while the call runs (the engine is busy: read from disk).
+    let bytes = std::fs::read(&rec).unwrap();
+    assert!(bytes.starts_with(b"%PDF-") && bytes.windows(5).any(|w| w == b"%%EOF"), "{} bytes", bytes.len());
+    // Once the call is over, the engine reads the unsaved edit back from it.
+    while s.ok("job_status", json!({"job_id": job}))["status"] == "running" {
+        std::thread::sleep(Duration::from_millis(100));
+    }
     let text = page_texts(&mut s, &rec).join(" ");
     assert!(text.contains("Typed before the long call"), "{text}");
 }
