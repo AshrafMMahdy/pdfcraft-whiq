@@ -388,6 +388,12 @@ impl Document {
         self.undo_label().map(Label::as_str)
     }
 
+    /// A count bumped on every change to the working file (edit, undo, redo, save): a later
+    /// state of the document has a higher one.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
     pub fn can_redo(&self) -> Option<&str> {
         self.redo_label().map(Label::as_str)
     }

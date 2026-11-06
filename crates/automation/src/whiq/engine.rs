@@ -10,7 +10,8 @@ use std::time::Instant;
 use serde_json::{Map, Value, json};
 
 use super::Settings;
-use super::contract::{WhiqError, classify, closest, code};
+use super::contract::{WhiqError, classify, closest, code, one_based, page_spec};
+use super::recovery::{DocSnap, Recovery};
 use crate::{Automation, Content, ToolError};
 
 /// What a running call reports: progress 0..1 that never goes back, the stage, steps.
@@ -20,6 +21,8 @@ pub struct Progress {
     pub total: u64,
     pub stage: String,
     pub stages: Vec<String>,
+    /// What the steps count (`pages`), when the progress message names it.
+    pub unit: String,
 }
 
 /// Handed to each call: the cancel flag and the progress the status tools read.
@@ -47,6 +50,12 @@ impl Ctx {
     }
 
     pub fn stage(&self, stage: &str, total: u64) {
+        self.stage_counting(stage, total, "");
+    }
+
+    /// [`Self::stage`] whose steps are `unit`s (`pages`): the progress message says
+    /// "<stage>: 3 of 10 pages done".
+    pub fn stage_counting(&self, stage: &str, total: u64, unit: &str) {
         let mut p = self.progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if p.stage != stage {
             p.stage = stage.to_string();
@@ -54,6 +63,7 @@ impl Ctx {
         }
         p.total = total;
         p.done = 0;
+        p.unit = unit.to_string();
     }
 
     pub fn step(&self, done: u64) {
@@ -93,12 +103,21 @@ pub struct Evicted {
     pub reason: String,
 }
 
-/// The auto-saved copy of a document with unsaved work, rewritten in place.
-struct Checkpoint {
-    path: Option<PathBuf>,
-    edits: u32,
-    since: Option<Instant>,
-    bytes_seen: usize,
+/// An `ocr` call under way: the pages done (their text added) and still to read, so a cancel,
+/// a failure or a panic says exactly what was kept and what remains.
+#[derive(Debug, Default)]
+pub(crate) struct OcrRun {
+    pub(crate) doc: u64,
+    /// 0-based, in the order read.
+    pub(crate) done: Vec<usize>,
+    pub(crate) remaining: Vec<usize>,
+    pub(crate) words: usize,
+    /// Per page: words found, or why it was skipped.
+    pub(crate) results: Vec<Value>,
+    /// A page of this run added words already (later pages join its undo step).
+    pub(crate) joined: bool,
+    /// Why adding a page's text failed (the run stops there).
+    pub(crate) failed: Option<WhiqError>,
 }
 
 pub struct Engine {
@@ -107,7 +126,8 @@ pub struct Engine {
     active: Option<u64>,
     /// Files this process wrote: writing them again replaces them (no OLD_ copy of our own output).
     written: HashSet<PathBuf>,
-    checkpoints: HashMap<u64, Checkpoint>,
+    /// What the checkpoint timer, SIGTERM and hang-up save from, published after each call.
+    pub(crate) recovery: Arc<Recovery>,
     pub(crate) evicted: Vec<Evicted>,
     /// Recovered files not yet named in an answer.
     pub(crate) recovered_unreported: Vec<Value>,
@@ -117,6 +137,13 @@ pub struct Engine {
     pub(crate) svg: HashMap<u64, pdfcraft_render::SvgRenderer>,
     /// Who the running call is for: its `caller`, else `--author`. Comments carry it.
     pub(crate) caller: Option<String>,
+    /// The documents open when the running call started, with their working files: a panic
+    /// releases only those the call opened or changed.
+    call_start: Vec<(u64, Arc<Vec<u8>>)>,
+    /// The running `edit`'s document as it was before the batch: put back if the call panics.
+    pub(crate) batch: Option<(u64, pdfcraft_engine::BatchCheckpoint)>,
+    /// The running `ocr`'s pages done and remaining.
+    pub(crate) ocr_run: Option<OcrRun>,
 }
 
 pub fn handle(id: u64) -> String {
@@ -148,19 +175,22 @@ pub fn now_utc() -> chrono::DateTime<chrono::Utc> {
 }
 
 impl Engine {
-    pub fn new(auto: Automation, settings: Arc<Settings>) -> Self {
+    pub fn new(auto: Automation, settings: Arc<Settings>, recovery: Arc<Recovery>) -> Self {
         let mut e = Engine {
             auto,
             settings,
             active: None,
             written: HashSet::new(),
-            checkpoints: HashMap::new(),
+            recovery,
             evicted: Vec::new(),
             recovered_unreported: Vec::new(),
             recovered_all: Vec::new(),
             ocr: None,
             svg: HashMap::new(),
             caller: None,
+            call_start: Vec::new(),
+            batch: None,
+            ocr_run: None,
         };
         e.scan_recovered();
         e
@@ -448,86 +478,87 @@ impl Engine {
     }
 
     pub fn checkpoints_value(&self) -> Value {
-        let files: Vec<Value> = self
-            .checkpoints
-            .iter()
-            .filter_map(|(id, c)| c.path.as_ref().map(|p| json!({"path": p.to_string_lossy(), "document": handle(*id), "pending_edits": c.edits})))
-            .collect();
-        json!({"every_edits": self.settings.checkpoint_edits, "every_secs": self.settings.checkpoint_secs, "files": files})
+        checkpoints_value(&self.recovery, &self.settings)
     }
 
     pub fn evicted_value(&self) -> Value {
         json!(self.evicted.iter().map(|e| json!({"document": e.handle, "name": e.name, "reason": e.reason, "recovered_path": e.recovered_path, "original_path": e.original_path})).collect::<Vec<_>>())
     }
 
-    /// After a call: count edits per document and write a checkpoint when one is due.
+    /// Publish the open documents to [`Recovery`] (the checkpoint timer, SIGTERM and hang-up
+    /// save from it): each one's working file when it has unsaved work, and where a new
+    /// recovered file of it goes. A document saved since is told to it (its checkpoint goes).
+    pub fn publish_recovery(&mut self) {
+        let mut docs = Vec::new();
+        for d in self.auto.session.docs() {
+            let id = d.id.0;
+            let generation = d.generation();
+            let prev = self.recovery.doc(id);
+            if !d.dirty && (prev.as_ref().is_some_and(|p| p.bytes.is_some()) || self.recovery.file_of(id).is_some()) {
+                self.recovery.saved(id, generation);
+            }
+            // A document with no place for its recovered file inside the write root is not
+            // saved from here (writing it would fail the same way on the worker).
+            let place = self.recovered_place(d);
+            let bytes = match prev.as_ref() {
+                _ if !d.dirty || place.is_err() => None,
+                Some(p) if p.generation == generation && p.bytes.is_some() => p.bytes.clone(),
+                _ => self.auto.session.recovery_snapshot(d.id).map(|r| r.bytes),
+            };
+            let (dir, stem) = place.unwrap_or_default();
+            docs.push(DocSnap { id, generation, bytes, dir, stem, original: d.path.clone(), since: None, edits: 0, seen: 0 });
+        }
+        self.recovery.publish(docs);
+        for (_, p, _) in self.recovery.files() {
+            self.written.insert(p);
+        }
+    }
+
+    /// Where a new recovered file of `d` goes (the write root, else beside the document, else
+    /// the working folder; resolved inside the write root) and its stem.
+    fn recovered_place(&self, d: &pdfcraft_engine::Document) -> Res<(PathBuf, String)> {
+        let stem = Path::new(&d.name).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "document".into());
+        let dir = self
+            .settings
+            .write_root
+            .clone()
+            .or_else(|| d.path.as_deref().and_then(|p| Path::new(p).parent().map(Path::to_path_buf)))
+            .unwrap_or_else(|| PathBuf::from("."));
+        // Resolved as a file in it is, so the folder is held to the write root.
+        let probe = dir.join(format!("{stem}.recovered.pdf"));
+        let resolved = self.auto.resolve(&probe.to_string_lossy(), true).map_err(|e| self.tool_error("evict", e))?;
+        Ok((resolved.parent().map(Path::to_path_buf).unwrap_or(dir), stem))
+    }
+
+    /// After a call: publish the documents, count the call as an edit of each document it
+    /// changed, and write a checkpoint when `--checkpoint-edits` is reached (the timer thread
+    /// writes the ones `--checkpoint-secs` makes due, during a call too).
     pub fn after_call(&mut self) {
-        let now = Instant::now();
-        let docs: Vec<(u64, bool, usize)> = self.auto.session.docs().iter().map(|d| (d.id.0, d.dirty, Arc::as_ptr(&d.bytes) as usize)).collect();
-        self.checkpoints.retain(|id, _| docs.iter().any(|d| d.0 == *id));
-        self.svg.retain(|id, _| docs.iter().any(|d| d.0 == *id));
-        for (id, dirty, ptr) in docs {
-            let c = self.checkpoints.entry(id).or_insert(Checkpoint { path: None, edits: 0, since: None, bytes_seen: ptr });
-            if !dirty {
-                // Saved (or undone to the saved state): the checkpoint is no longer needed.
-                if let Some(p) = c.path.take() {
-                    remove_resolved(&self.auto, &p);
-                }
-                c.edits = 0;
-                c.since = None;
-                c.bytes_seen = ptr;
-                continue;
-            }
-            if c.bytes_seen != ptr {
-                c.bytes_seen = ptr;
-                c.edits = c.edits.saturating_add(1);
-                c.since.get_or_insert(now);
-            }
-            let by_edits = self.settings.checkpoint_edits > 0 && c.edits >= self.settings.checkpoint_edits;
-            let by_time = self.settings.checkpoint_secs > 0
-                && c.edits > 0
-                && c.since.is_some_and(|s| now.duration_since(s).as_secs() >= self.settings.checkpoint_secs);
-            if by_edits || by_time {
-                let existing = c.path.clone();
-                if let Ok(p) = self.write_recovered(id, existing.as_deref())
-                    && let Some(c) = self.checkpoints.get_mut(&id)
-                {
-                    c.path = Some(p);
-                    c.edits = 0;
-                    c.since = None;
-                }
+        self.publish_recovery();
+        let ids: Vec<u64> = self.open_ids();
+        self.svg.retain(|id, _| ids.contains(id));
+        for id in ids {
+            let Ok(generation) = self.doc(id).map(pdfcraft_engine::Document::generation) else { continue };
+            let edits = self.recovery.count_edit(id, generation);
+            if self.settings.checkpoint_edits > 0 && edits >= self.settings.checkpoint_edits {
+                let _ = self.write_recovered(id);
             }
         }
     }
 
-    /// Write document `id`'s current state to its recovered file (`at`, or a new
+    /// Write document `id`'s current state to its recovered file (the one it has, else a new
     /// `<stem>.recovered-<stamp>.pdf` in the write root, else beside the document).
-    pub fn write_recovered(&mut self, id: u64, at: Option<&Path>) -> Res<PathBuf> {
+    pub fn write_recovered(&mut self, id: u64) -> Res<PathBuf> {
         let d = self.doc(id)?;
+        let generation = d.generation();
+        let (dir, stem) = self.recovered_place(d)?;
         let bytes =
             self.auto.session.save_bytes(d.id).or_else(|_| self.auto.session.save_full_bytes(d.id)).map_err(|e| classify(&e.to_string(), "evict"))?;
-        let target = match at {
-            Some(p) => p.to_path_buf(),
-            None => {
-                let stem = Path::new(&d.name).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "document".into());
-                let dir = self
-                    .settings
-                    .write_root
-                    .clone()
-                    .or_else(|| d.path.as_deref().and_then(|p| Path::new(p).parent().map(Path::to_path_buf)))
-                    .unwrap_or_else(|| PathBuf::from("."));
-                let base = format!("{stem}.recovered-{}", stamp());
-                let mut cand = dir.join(format!("{base}.pdf"));
-                let mut n = 2u32;
-                while cand.exists() && n < 1000 {
-                    cand = dir.join(format!("{base}-{n}.pdf"));
-                    n += 1;
-                }
-                cand
-            }
-        };
-        let target = self.auto.resolve(&target.to_string_lossy(), true).map_err(|e| self.tool_error("evict", e))?;
-        crate::paths::write_atomic(&target, &bytes).map_err(|e| self.tool_error("evict", e))?;
+        let target = self
+            .recovery
+            .write(id, generation, &bytes, &dir, &stem, false)
+            .map_err(|e| classify(&e, "evict"))?
+            .ok_or_else(|| WhiqError::new(code::INTERNAL, format!("{} was not written", handle(id)), "call evict again"))?;
         self.written.insert(target.clone());
         Ok(target)
     }
@@ -535,16 +566,21 @@ impl Engine {
     /// Release every open document: unsaved work auto-saved to a recovered file first. A save that
     /// fails leaves that document open (nothing is lost).
     pub fn evict_all(&mut self, reason: &str) -> Value {
+        let ids = self.open_ids();
+        self.evict(&ids, reason)
+    }
+
+    /// Release documents `ids` (as [`Self::evict_all`] releases every one).
+    pub fn evict(&mut self, ids: &[u64], reason: &str) -> Value {
         let mut out = Vec::new();
-        for id in self.open_ids() {
+        for &id in ids {
             let (name, path, dirty) = match self.doc(id) {
                 Ok(d) => (d.name.clone(), d.path.clone(), d.dirty),
                 Err(_) => continue,
             };
             let mut recovered = None;
             if dirty {
-                let existing = self.checkpoints.get(&id).and_then(|c| c.path.clone());
-                match self.write_recovered(id, existing.as_deref()) {
+                match self.write_recovered(id) {
                     Ok(p) => recovered = Some(p.to_string_lossy().into_owned()),
                     Err(e) => {
                         out.push(json!({"document": handle(id), "name": name, "kept_open": true, "error": e.object()}));
@@ -553,7 +589,7 @@ impl Engine {
                 }
             }
             let _ = self.tool("doc_close", json!({"doc": id, "discard_changes": true}));
-            self.checkpoints.remove(&id);
+            self.recovery.forget(id, false);
             if let Some(r) = &recovered {
                 let v = json!({"path": r, "reason": reason, "original": path, "at": now_utc().to_rfc3339()});
                 self.recovered_unreported.push(v.clone());
@@ -572,7 +608,81 @@ impl Engine {
         if self.active.is_some_and(|a| !self.doc_exists(a)) {
             self.active = None;
         }
+        self.publish_recovery();
         json!({"evicted": out, "next_step": "every call that needs a released document answers evicted with the file to reopen"})
+    }
+
+    /// Before the worker runs a call: what is open, so a panic releases only what the call
+    /// opened or changed.
+    pub fn begin_call(&mut self) {
+        self.call_start = self.auto.session.docs().iter().map(|d| (d.id.0, d.bytes.clone())).collect();
+        self.batch = None;
+        self.ocr_run = None;
+    }
+
+    /// A call panicked (a bug): put back the batch it was applying, auto-save and release only
+    /// the documents it opened or changed (the others stay open as they are), and say what of
+    /// the call was kept.
+    pub fn after_panic(&mut self, name: &str, msg: &str) -> WhiqError {
+        let restored = self.batch.take().map(|(id, c)| (id, self.auto.session.batch_restore(pdfcraft_engine::DocId(id), c).is_ok()));
+        let run = self.ocr_run.take();
+        let mut ids: Vec<u64> = self
+            .auto
+            .session
+            .docs()
+            .iter()
+            .filter(|d| !self.call_start.iter().any(|(id, b)| *id == d.id.0 && Arc::ptr_eq(b, &d.bytes)))
+            .map(|d| d.id.0)
+            .collect();
+        for id in restored.iter().map(|r| r.0).chain(run.iter().map(|r| r.doc)) {
+            if !ids.contains(&id) && self.doc_exists(id) {
+                ids.push(id);
+            }
+        }
+        self.call_start.clear();
+        let released = self.evict(&ids, "panic");
+        let handles = ids.iter().map(|id| handle(*id)).collect::<Vec<_>>().join(", ");
+        let reopen = if ids.is_empty() {
+            "no document was changed".to_string()
+        } else {
+            format!(
+                "only {handles} released, its unsaved work auto-saved (evicted lists each recovered_path; with none, its original file has all of it); the other documents stay open"
+            )
+        };
+        let e = match (restored, run) {
+            (Some((id, true)), _) => WhiqError::new(
+                code::INTERNAL,
+                format!("{name} failed inside the engine: {msg}. Nothing of the call was applied: {} was put back as it was before it", handle(id)),
+                format!("{reopen}: open_document with that file and send the call again (once)"),
+            )
+            .with("applied", false),
+            (Some((id, false)), _) => WhiqError::new(
+                code::INTERNAL,
+                format!(
+                    "{name} failed inside the engine: {msg}. {} could not be put back as it was before the call, so part of the batch may be in it",
+                    handle(id)
+                ),
+                format!(
+                    "{reopen}: open_document with that file, check which operations are in it (read, list_content), and send only the missing ones"
+                ),
+            )
+            .with("applied", "unknown"),
+            (None, Some(run)) => {
+                let mut e = WhiqError::new(
+                    code::INTERNAL,
+                    format!("{name} failed inside the engine: {msg}. {}", ocr_kept(&run)),
+                    format!("{reopen}: open_document with that file and {}", ocr_rest(&run)),
+                );
+                e.details = ocr_details(&run);
+                e
+            }
+            (None, None) => WhiqError::new(
+                code::INTERNAL,
+                format!("{name} failed inside the engine: {msg}"),
+                format!("{reopen}; call again once (open_document first if it was released)"),
+            ),
+        };
+        e.with("evicted", released)
     }
 
     /// The OCR engine, loaded once.
@@ -613,11 +723,7 @@ impl Engine {
                     .with("document", handle(id)));
                 }
                 self.tool("doc_close", json!({"doc": id, "discard_changes": true}))?;
-                if let Some(c) = self.checkpoints.remove(&id)
-                    && let Some(p) = c.path
-                {
-                    remove_resolved(&self.auto, &p);
-                }
+                self.recovery.forget(id, true);
                 if self.active == Some(id) {
                     self.active = None;
                 }
@@ -819,21 +925,74 @@ impl Engine {
         self.auto.session.docs().iter().rev().find(|d| d.path.as_deref() == Some(&*s)).map(|d| d.id.0)
     }
 
+    /// `ocr`: page by page. Each page's text is added as soon as it is read (and published, so
+    /// a checkpoint, SIGTERM or hang-up keeps it), progress counts the pages, and a cancel or a
+    /// failure keeps the pages done and names the ones left.
     fn ocr(&mut self, a: &Map<String, Value>, ctx: &Ctx) -> Res<Reply> {
         let id = self.target(a, Some("path"))?;
         let count = self.doc(id)?.info.pages.len();
         let pages = super::contract::parse_pages(a.get("pages").unwrap_or(&Value::Null), count)?;
-        let mut args = json!({"doc": id, "pages": super::contract::one_based(&pages)});
+        let mut args = json!({"doc": id});
         if let Some(d) = a.get("dpi") {
             args["dpi"] = d.clone();
         }
         if let Some(s) = a.get("skip_text_pages") {
             args["skip_text_pages"] = s.clone();
         }
-        self.ocr_engine()?;
-        ctx.stage("recognising text", pages.len() as u64);
-        let mut v = self.tool("ocr_recognize", args)?;
-        ctx.step(pages.len() as u64);
+        let settings = self.auto.ocr_settings(&crate::json::Args(&args)).map_err(|e| self.tool_error("ocr_recognize", e))?;
+        let doc = self.doc(id)?;
+        if let Some(why) = doc.read_only_reason.clone() {
+            return Err(classify(&why, "ocr"));
+        }
+        // The recognised words are listed only when the document allows copying.
+        let copy = doc.allows_copying();
+        let ocr = self.ocr_engine()?;
+        let job = self
+            .auto
+            .session
+            .ocr_job(pdfcraft_engine::DocId(id), &pages, settings)
+            .ok_or_else(|| WhiqError::new(code::NOT_FOUND, format!("no open document {}", handle(id)), "open it with open_document"))?;
+        let hook = |k: &str| if self.settings.test_hooks { a.get(k).and_then(Value::as_u64) } else { None };
+        let (stop_after, panic_after) = (hook("__stop_after_pages"), hook("__panic_after_pages"));
+        let total = job.pages.len();
+        self.ocr_run = Some(OcrRun { doc: id, remaining: job.pages.clone(), ..OcrRun::default() });
+        self.publish_recovery();
+        ctx.stage_counting("recognising text", total as u64, "pages");
+        job.run_each(
+            &ocr,
+            |done, _| {
+                ctx.step(done as u64);
+                !ctx.cancelled()
+            },
+            |found| {
+                let kept = self.ocr_keep(id, found, copy);
+                let done = self.ocr_run.as_ref().map_or(0, |r| r.done.len() as u64);
+                if stop_after == Some(done) {
+                    ctx.cancel.store(true, Ordering::SeqCst);
+                }
+                if panic_after == Some(done) {
+                    test_hook_panic("ocr");
+                }
+                kept
+            },
+        );
+        let run = self.ocr_run.take().unwrap_or_default();
+        if let Some(err) = run.failed.clone() {
+            let mut e = WhiqError::new(err.code, format!("{} {}", err.reason, ocr_kept(&run)), format!("{}; then {}", err.next_step, ocr_rest(&run)));
+            e.details = ocr_details(&run);
+            return Err(e.with("page_error", err.object()));
+        }
+        if ctx.cancelled() && !run.remaining.is_empty() {
+            // Stopped by cancel: what was read stays.
+            let mut e = WhiqError::new(
+                code::CANCELLED,
+                format!("the call was cancelled. {}", ocr_kept(&run)),
+                format!("the text added stays in {} (save_document keeps it); to go on, {}", handle(id), ocr_rest(&run)),
+            );
+            e.details = ocr_details(&run);
+            return Err(e);
+        }
+        let mut v = json!({"words": run.words, "pages": run.results});
         if let Some(out) = a.get("save_to").and_then(Value::as_str).filter(|s| !s.trim().is_empty()) {
             let saved = self.save_document(
                 &json!({"document": handle(id), "path": out, "overwrite": a.get("overwrite").cloned().unwrap_or(json!(false))})
@@ -848,16 +1007,100 @@ impl Engine {
         }
         Ok(v.into())
     }
-}
 
-/// Up to five files next to a missing one, for `closest`.
-/// Remove a file this engine wrote (a checkpoint), resolved inside the write root first.
-fn remove_resolved(auto: &Automation, p: &Path) {
-    if let Ok(t) = auto.resolve(&p.to_string_lossy(), true) {
-        let _ = std::fs::remove_file(t);
+    /// Add one page's recognised text to document `id` and record it in the run; whether to go
+    /// on to the next page. A page that could not be read is reported as skipped (the run goes
+    /// on); text that could not be added stops the run.
+    fn ocr_keep(&mut self, id: u64, found: pdfcraft_engine::ocr::OcrPage, copy: bool) -> bool {
+        let joins = self.ocr_run.as_ref().is_some_and(|r| r.joined);
+        let added = self.auto.session.apply_ocr_page(pdfcraft_engine::DocId(id), &found, joins);
+        let Some(run) = self.ocr_run.as_mut() else { return false };
+        match added {
+            Ok(words) => {
+                run.joined |= words > 0;
+                run.words += words;
+                run.done.push(found.page);
+                run.remaining.retain(|p| *p != found.page);
+                run.results.push(match &found.skipped {
+                    Some(why) => json!({ "page": found.page + 1, "skipped": why }),
+                    None if copy => json!({ "page": found.page + 1, "words": words, "already_on_page": found.already_on_page, "text": found.text() }),
+                    None => json!({ "page": found.page + 1, "words": words, "already_on_page": found.already_on_page }),
+                });
+                if words > 0 {
+                    self.publish_recovery();
+                }
+                true
+            }
+            Err(e) => {
+                run.failed = Some(classify(&e.to_string(), "ocr").with("page", found.page + 1));
+                false
+            }
+        }
     }
 }
 
+/// The checkpoint settings and files (written by the worker or the timer), as server_status
+/// lists them.
+pub fn checkpoints_value(recovery: &Recovery, settings: &Settings) -> Value {
+    let files: Vec<Value> = recovery
+        .files()
+        .into_iter()
+        .map(|(id, p, edits)| json!({"path": p.to_string_lossy(), "document": handle(id), "pending_edits": edits}))
+        .collect();
+    json!({"every_edits": settings.checkpoint_edits, "every_secs": settings.checkpoint_secs, "files": files})
+}
+
+/// What an `ocr` run kept: "The text of pages 1-3 was added and kept (12 words)…".
+fn ocr_kept(run: &OcrRun) -> String {
+    let mut done = one_based(&run.done);
+    done.sort_unstable();
+    if done.is_empty() {
+        return format!("No page was finished, so nothing was added to {}.", handle(run.doc));
+    }
+    let left = if run.remaining.is_empty() { String::new() } else { format!("; pages {} were not read", ocr_left(run)) };
+    format!("Pages {} of {} were read and their text added ({} words){left}.", page_spec(&done), handle(run.doc), run.words)
+}
+
+/// The pages an `ocr` run did not read, as a page selection.
+fn ocr_left(run: &OcrRun) -> String {
+    let mut left = one_based(&run.remaining);
+    left.sort_unstable();
+    page_spec(&left)
+}
+
+/// How to read only what an `ocr` run left: the same call with `pages`.
+fn ocr_rest(run: &OcrRun) -> String {
+    if run.remaining.is_empty() {
+        return "every page was read".into();
+    }
+    format!("call ocr with pages: \"{}\" to read only the pages left", ocr_left(run))
+}
+
+/// The pages done and left, for the error object.
+fn ocr_details(run: &OcrRun) -> Map<String, Value> {
+    let mut done = one_based(&run.done);
+    done.sort_unstable();
+    let mut left = one_based(&run.remaining);
+    left.sort_unstable();
+    let mut m = Map::new();
+    m.insert("document".into(), json!(handle(run.doc)));
+    m.insert("pages_done".into(), json!(done));
+    m.insert("pages_remaining".into(), json!(left));
+    m.insert("continue_with".into(), if left.is_empty() { Value::Null } else { json!({"pages": page_spec(&left)}) });
+    m.insert("words".into(), json!(run.words));
+    // The text itself is in the document (read gives it); only the pages skipped are listed.
+    let skipped: Vec<&Value> = run.results.iter().filter(|r| r.get("skipped").is_some()).collect();
+    m.insert("pages_skipped".into(), json!(skipped));
+    m
+}
+
+/// A test hook (`PDFCRAFT_MCP_TEST_HOOKS=1` only): a bug inside a call, to prove nothing is lost.
+#[allow(clippy::panic)]
+pub(crate) fn test_hook_panic(at: &str) -> ! {
+    panic!("test hook: panic in {at}")
+}
+
+/// Up to five files next to a missing one, for `closest`.
 /// `path` was resolved inside a root by the caller ([`Engine::resolve_input`]).
 pub fn nearby_resolved_files(path: &Path) -> Vec<String> {
     let Some(dir) = path.parent() else { return Vec::new() };

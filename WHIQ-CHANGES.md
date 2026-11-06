@@ -25,6 +25,14 @@ tool-table MCP server unchanged.
   hang-up and SIGTERM (exit 143), and every `--checkpoint-edits` (20) edits or
   `--checkpoint-secs` (60); a later process names the files it finds (`recovered_files`,
   reason `found`). A released document answers `evicted` with `recovered_path` / `original_path`.
+  The checkpoint timer, SIGTERM and hang-up save from the documents the worker last published
+  (`recovery.rs`: after every call, and after every page `ocr` adds), so a long call does not
+  hold them up: SIGTERM exits 143 at once, hang-up saves at once and again when the running call
+  ends. A panic (a bug) puts back the batch `edit` was applying (`applied: false`), and only the
+  documents the call opened or changed are auto-saved and released; the others stay open.
+- `ocr` goes page by page: progress `"recognising text: 3 of 10 pages done"` (steps counted in
+  pages), each page's text added as it is read (one undo step per call), and a cancel, a failure
+  or a panic answers `pages_done`, `pages_remaining` and `continue_with: {pages}`.
 - `contract.rs` — the error object, the eighteen codes, forgiving tool and argument names
   (case, camelCase, synonyms, numbers and booleans as strings, enum values in any case), page
   selections (`"1-3,7"`, `"10-"`, `"last"`, lists), and results cut at their largest list with
@@ -37,13 +45,15 @@ tool-table MCP server unchanged.
 - `preview.rs` — the preview pane's renderer: SVG (vector, with an invisible selectable text
   layer) or PNG, windowed.
 - `edit.rs` — the batch editor and `list_operations`.
+- `recovery.rs` — the published documents the checkpoint timer, SIGTERM and hang-up save from.
 - `convert.rs` — images, text, HTML and Markdown to PDF (a typesetter for HTML and Markdown).
 
 Other changes, each small and additive: `pdfcraft-render` gains `svg` (`SvgRenderer`,
 hayro-svg 0.7 over the same vendored hayro-interpret); `pdfcraft-engine` gains
 `Document::export_pages_window` (the export model for a window of pages) and
 `Session::batch_checkpoint` / `batch_restore` (all-or-nothing batches beyond the 100-step undo
-limit) and `Session::create_from_document`; `pdfcraft-export` gains `markdown_pages` (Markdown per
+limit), `Session::create_from_document`, `OcrJob::run_each` / `Session::apply_ocr_page` (OCR
+kept page by page, one undo step) and `Session::recovery_snapshot` / `Document::generation`; `pdfcraft-export` gains `markdown_pages` (Markdown per
 page); `pdfcraft-create` exposes `append_page` and `set_document_title`.
 
 ## 2. Tools

@@ -13,7 +13,11 @@
 //! - Unsaved work is never lost: checkpoints every `--checkpoint-edits` edits or
 //!   `--checkpoint-secs` seconds, and on `evict`, idle (`--idle-evict-secs`), memory
 //!   (`--max-memory-mb`, after a call, never during one), hang-up and SIGTERM every dirty
-//!   document is written to `<name>.recovered-<stamp>.pdf` in the write root.
+//!   document is written to `<name>.recovered-<stamp>.pdf` in the write root. The timer, SIGTERM
+//!   and hang-up save from the documents the worker last published ([`recovery`]), so a long
+//!   call (OCR, a big save) does not hold them up; `ocr` publishes after every page.
+//! - A panic (a bug) fails the call, puts back the batch it was applying and releases only the
+//!   documents it opened or changed, auto-saved; the others stay open.
 //! - Errors are results: `isError`, `structuredContent.error = {code, reason, next_step, …}` with
 //!   one of eighteen codes; protocol errors carry the same object in `error.data`.
 
@@ -24,6 +28,7 @@ mod edit;
 mod engine;
 mod preview;
 mod read;
+mod recovery;
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
@@ -39,6 +44,7 @@ use serde_json::{Map, Value, json};
 use crate::Automation;
 use contract::{WhiqError, closest, code, normalize_args, squash, tool_alias, trim_result};
 use engine::{Ctx, Engine, Reply};
+use recovery::Recovery;
 
 /// The server's flags (`pdfcraft-cli mcp --help` names them).
 #[derive(Clone, Debug)]
@@ -123,6 +129,8 @@ struct Shared {
     out_failed: std::sync::atomic::AtomicBool,
     settings: Arc<Settings>,
     started: Instant,
+    /// The documents as the worker last published them, for the threads that save without it.
+    recovery: Arc<Recovery>,
 }
 
 enum Work {
@@ -207,7 +215,11 @@ fn progress_fields(j: &Job) -> Value {
     } else {
         0.0
     };
-    json!({"progress": frac, "stage": if p.stage.is_empty() { j.tool.clone() } else { p.stage.clone() }, "steps": {"done": p.done, "total": p.total}, "stages": p.stages})
+    let mut steps = json!({"done": p.done, "total": p.total});
+    if !p.unit.is_empty() {
+        steps["unit"] = json!(p.unit);
+    }
+    json!({"progress": frac, "stage": if p.stage.is_empty() { j.tool.clone() } else { p.stage.clone() }, "steps": steps, "stages": p.stages})
 }
 
 fn job_summary(id: u64, j: &Job) -> Value {
@@ -248,6 +260,7 @@ pub fn serve(
         out_failed: std::sync::atomic::AtomicBool::new(false),
         settings: settings.clone(),
         started: Instant::now(),
+        recovery: Recovery::new(),
     });
     let (tx, rx) = mpsc::channel::<Work>();
     let worker = {
@@ -263,13 +276,24 @@ pub fn serve(
         }
     }
     // SIGTERM / SIGINT / SIGHUP (Ctrl-C, Ctrl-Break, console close on Windows): unsaved work is
-    // auto-saved, then the process exits with 143.
+    // auto-saved from the documents last published, here and now (not behind a running call),
+    // then the process exits with 143.
     {
-        let tx = Mutex::new(tx.clone());
+        let recovery = shared.recovery.clone();
         let _ = ctrlc::set_handler(move || {
-            let _ = lock(&tx).send(Work::Shutdown("signal".into()));
+            recovery.save_all("signal");
+            std::process::exit(143);
         });
     }
+    // Checkpoints by time, during a long call too: `--checkpoint-secs` after unsaved work was
+    // published without reaching a recovered file.
+    let timer = (settings.checkpoint_secs > 0)
+        .then(|| {
+            let recovery = shared.recovery.clone();
+            let every = Duration::from_secs(settings.checkpoint_secs);
+            std::thread::Builder::new().name("pdfcraft-whiq-checkpoint".into()).spawn(move || recovery.run_timer(every)).ok()
+        })
+        .flatten();
     // Idle eviction.
     if let Some(secs) = settings.idle_evict_secs.filter(|s| *s > 0) {
         let shared = shared.clone();
@@ -329,9 +353,15 @@ pub fn serve(
         }
     }
     // Hang-up: the calls that arrived before it are served, then unsaved work is auto-saved and
-    // the worker stops.
+    // the worker stops. While a call still runs, the work published so far is auto-saved at once
+    // (a kill while waiting loses nothing); the worker writes the final state over it.
     {
         let mut st = lock(&shared.state);
+        if st.running.is_some() || !st.queue.is_empty() {
+            drop(st);
+            shared.recovery.save_all("disconnect");
+            st = lock(&shared.state);
+        }
         while st.running.is_some() || !st.queue.is_empty() {
             st = shared.cv.wait_timeout(st, Duration::from_millis(200)).map_or_else(|e| e.into_inner().0, |r| r.0);
         }
@@ -339,6 +369,10 @@ pub fn serve(
     }
     let _ = tx.send(Work::Shutdown("disconnect".into()));
     let _ = worker.join();
+    shared.recovery.stop();
+    if let Some(t) = timer {
+        let _ = t.join();
+    }
     if shared.out_failed.load(Ordering::SeqCst) {
         return Err(std::io::Error::other("an answer could not be written to stdout"));
     }
@@ -425,10 +459,18 @@ fn call(shared: &Arc<Shared>, tx: &mpsc::Sender<Work>, id: Value, raw: &str, arg
         );
         return;
     };
-    let (args, warnings) = match defs::find(&name) {
+    // Test hooks (`__…` arguments) pass the schema only with PDFCRAFT_MCP_TEST_HOOKS=1.
+    let hooks: Vec<(String, Value)> = if shared.settings.test_hooks {
+        args.iter().filter(|(k, _)| k.starts_with("__")).map(|(k, v)| (k.clone(), v.clone())).collect()
+    } else {
+        Vec::new()
+    };
+    let (mut args, warnings) = match defs::find(&name) {
         Some(def) => normalize_args(def.get("inputSchema").unwrap_or(&Value::Null), &args),
         None => (args, Vec::new()),
     };
+    let warnings: Vec<String> = warnings.into_iter().filter(|w| !hooks.iter().any(|(k, _)| w.contains(&format!("`{k}`")))).collect();
+    args.extend(hooks);
     lock(&shared.state).calls += 1;
     match name.as_str() {
         "server_status" => return shared.reply(&id, with_warnings(ok_result(&server_status(shared), &[]), &warnings)),
@@ -626,13 +668,24 @@ fn run_call(shared: &Arc<Shared>, tx: &mpsc::Sender<Work>, req: CallReq) {
             if let Some(j) = st.jobs.get(&job) {
                 let p = lock(&j.ctx.progress).clone();
                 let progress = p.done.max(beats);
-                let mut params = json!({"progressToken": tok, "progress": progress, "message": format!("{} ({} s)", if p.stage.is_empty() { name.as_str() } else { p.stage.as_str() }, beats)});
+                let mut params = json!({"progressToken": tok, "progress": progress, "message": progress_message(&p, &name, beats)});
                 if p.total > 0 && p.done >= beats {
                     params["total"] = json!(p.total);
                 }
                 shared.send(&json!({"jsonrpc": "2.0", "method": "notifications/progress", "params": params}));
             }
         }
+    }
+}
+
+/// A progress notification's text: `"recognising text: 3 of 10 pages done (12 s)"` for a stage
+/// that counts its steps, else `"<stage> (12 s)"`.
+fn progress_message(p: &engine::Progress, tool: &str, secs: u64) -> String {
+    let stage = if p.stage.is_empty() { tool } else { p.stage.as_str() };
+    if p.unit.is_empty() || p.total == 0 {
+        format!("{stage} ({secs} s)")
+    } else {
+        format!("{stage}: {} of {} {} done ({secs} s)", p.done, p.total, p.unit)
     }
 }
 
@@ -662,7 +715,8 @@ fn job_status(shared: &Shared, id: Option<&Value>) -> Value {
             let sc = r.get("structuredContent").cloned().unwrap_or(Value::Null);
             if r.get("isError").and_then(Value::as_bool) == Some(true) {
                 s["error"] = sc.get("error").cloned().unwrap_or(sc);
-                s["next_step"] = json!(if status == "cancelled" { "the call was cancelled; nothing of it was kept" } else { "read error.next_step" });
+                // A cancelled call says itself what was kept (an ocr keeps the pages it read).
+                s["next_step"] = if status == "cancelled" { s["error"]["next_step"].clone() } else { json!("read error.next_step") };
             } else {
                 s["result"] = sc;
                 s["next_step"] = json!("done: the result is here");
@@ -703,7 +757,7 @@ fn cancel(shared: &Shared, id: Option<&Value>) -> Value {
     j.ctx.cancel.store(true, Ordering::SeqCst);
     ok_result(
         &json!({"cancelled": true, "status": "cancelling", "job_id": job_name(n), "tool": j.tool, "retry_after_ms": 200,
-                "next_step": "the call stops at its next step and leaves the document as it was before it; job_status shows when"}),
+                "next_step": "the call stops at its next step (an edit batch leaves the document as it was before it; ocr keeps the pages it read); job_status shows when and what was kept"}),
         &[],
     )
 }
@@ -736,7 +790,8 @@ fn server_status(shared: &Shared) -> Value {
         "jobs": jobs,
         "recovered_files": snap.get("recovered_files").cloned().unwrap_or(json!([])),
         "evicted": snap.get("evicted").cloned().unwrap_or(json!([])),
-        "checkpoints": snap.get("checkpoints").cloned().unwrap_or(json!({})),
+        // Live: the timer writes checkpoints during a call too.
+        "checkpoints": engine::checkpoints_value(&shared.recovery, s),
         "idle_ms": idle,
         "calls": calls,
         "busy_replies": busy,
@@ -767,7 +822,7 @@ fn skip_from(mut v: Value, from: usize) -> Value {
 }
 
 fn worker_loop(auto: Automation, settings: Arc<Settings>, shared: &Shared, rx: &mpsc::Receiver<Work>) {
-    let mut engine = Engine::new(auto, settings.clone());
+    let mut engine = Engine::new(auto, settings.clone(), shared.recovery.clone());
     publish(&engine, shared);
     lock(&shared.state).ready = true;
     shared.cv.notify_all();
@@ -776,6 +831,7 @@ fn worker_loop(auto: Automation, settings: Arc<Settings>, shared: &Shared, rx: &
             Work::Call { job, name, args, ctx } => {
                 let from = args.get("continue_from").and_then(Value::as_u64).map_or(0, |n| usize::try_from(n).unwrap_or(0));
                 let max = args.get("max_bytes").and_then(Value::as_u64).and_then(|n| usize::try_from(n).ok()).unwrap_or(settings.max_result_bytes);
+                engine.begin_call();
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| engine.call(&name, &args, &ctx)));
                 let (status, result) = match outcome {
                     Ok(Ok(Reply { mut value, images })) => {
@@ -791,24 +847,15 @@ fn worker_loop(auto: Automation, settings: Arc<Settings>, shared: &Shared, rx: &
                     }
                     Ok(Err(e)) => (if e.code == code::CANCELLED { "cancelled" } else { "failed" }, e.result(&[])),
                     Err(p) => {
-                        // A panic is a bug: the call fails, unsaved work is written to recovered files,
-                        // and the server carries on.
+                        // A panic is a bug: the call fails, the batch it was applying is put back,
+                        // the documents it opened or changed are auto-saved and released (only
+                        // those), and the server carries on.
                         let msg = p
                             .downcast_ref::<&str>()
                             .map(ToString::to_string)
                             .or_else(|| p.downcast_ref::<String>().cloned())
                             .unwrap_or_else(|| "panic".into());
-                        let saved = engine.evict_all("panic");
-                        (
-                            "failed",
-                            WhiqError::new(
-                                code::INTERNAL,
-                                format!("{name} failed inside the engine: {msg}"),
-                                "the open documents were auto-saved (recovered_path); reopen and retry once",
-                            )
-                            .with("evicted", saved)
-                            .result(&[]),
-                        )
+                        ("failed", engine.after_panic(&name, &msg).result(&[]))
                     }
                 };
                 // Memory over the budget: released after the call, never during one.
@@ -846,9 +893,6 @@ fn worker_loop(auto: Automation, settings: Arc<Settings>, shared: &Shared, rx: &
             Work::Shutdown(reason) => {
                 let _ = engine.evict_all(&reason);
                 publish(&engine, shared);
-                if reason == "signal" {
-                    std::process::exit(143);
-                }
                 return;
             }
         }

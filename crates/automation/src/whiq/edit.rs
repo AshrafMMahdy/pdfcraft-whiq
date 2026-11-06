@@ -123,7 +123,8 @@ pub fn edit(e: &mut Engine, a: &Map<String, Value>, ctx: &Ctx) -> Res<Reply> {
         ));
     }
     let keep_going = a.get("keep_going").and_then(Value::as_bool).unwrap_or(false);
-    let checkpoint = e.auto.session.batch_checkpoint(DocId(id));
+    // Kept on the engine, not here, so a panic mid-batch puts the document back too.
+    e.batch = e.auto.session.batch_checkpoint(DocId(id)).map(|c| (id, c));
     ctx.stage("applying operations", ops.len() as u64);
     let mut results: Vec<Value> = Vec::new();
     let mut applied = 0usize;
@@ -131,7 +132,7 @@ pub fn edit(e: &mut Engine, a: &Map<String, Value>, ctx: &Ctx) -> Res<Reply> {
     for (i, op) in ops.iter().enumerate() {
         let name = op.get("op").and_then(Value::as_str).unwrap_or("").to_string();
         if let Err(err) = ctx.check() {
-            let rolled = restore(e, id, checkpoint);
+            let rolled = restore(e);
             return Err(err.with("stopped_at", i).with("results", json!(results)).with("rolled_back", rolled));
         }
         let outcome = match op.as_object() {
@@ -148,7 +149,7 @@ pub fn edit(e: &mut Engine, a: &Map<String, Value>, ctx: &Ctx) -> Res<Reply> {
                 results.push(json!({"index": i, "op": name, "status": "failed", "error": err.object()}));
             }
             Err(err) => {
-                let rolled = restore(e, id, checkpoint);
+                let rolled = restore(e);
                 let reason =
                     format!("op {i} ({name}) failed: {}{}", err.reason, if rolled { "; the document is as it was before this call" } else { "" });
                 let mut out = WhiqError::new(err.code, reason, err.next_step.clone());
@@ -167,6 +168,8 @@ pub fn edit(e: &mut Engine, a: &Map<String, Value>, ctx: &Ctx) -> Res<Reply> {
         let saved = e.call("save_document", &sa, ctx)?;
         v["saved"] = saved.value;
     }
+    // Done (and saved, if asked): nothing to put back any more.
+    e.batch = None;
     let s = e.summary(id);
     v["pages"] = s.get("pages").cloned().unwrap_or(Value::Null);
     v["dirty"] = s.get("dirty").cloned().unwrap_or(Value::Null);
@@ -175,9 +178,9 @@ pub fn edit(e: &mut Engine, a: &Map<String, Value>, ctx: &Ctx) -> Res<Reply> {
 }
 
 /// Put the document back as it was before the batch; whether that happened.
-fn restore(e: &mut Engine, id: u64, checkpoint: Option<pdfcraft_engine::BatchCheckpoint>) -> bool {
-    match checkpoint {
-        Some(c) => e.auto.session.batch_restore(DocId(id), c).is_ok(),
+fn restore(e: &mut Engine) -> bool {
+    match e.batch.take() {
+        Some((id, c)) => e.auto.session.batch_restore(DocId(id), c).is_ok(),
         None => false,
     }
 }
@@ -209,6 +212,9 @@ fn run_op(e: &mut Engine, id: u64, op: &Map<String, Value>, ctx: &Ctx) -> Res<Va
         op.get("op").and_then(Value::as_str).ok_or_else(|| WhiqError::invalid("an op has no `op` name", "each op is {op: name, …arguments}"))?;
     let name = squash(raw);
     let name = op_alias(&name).to_string();
+    if name == "__panic" && e.settings.test_hooks {
+        super::engine::test_hook_panic("edit");
+    }
     let count = e.doc(id)?.info.pages.len();
     let mut args: Map<String, Value> =
         op.iter().filter(|(k, _)| k.as_str() != "op" && k.as_str() != "caller").map(|(k, v)| (k.clone(), v.clone())).collect();

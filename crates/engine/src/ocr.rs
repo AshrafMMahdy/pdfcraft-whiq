@@ -110,11 +110,23 @@ pub struct OcrJob {
 impl OcrJob {
     /// Read the pages. `progress(done, total)` is called before each page; returning `false`
     /// stops (the pages read so far are returned).
-    pub fn run(self, ocr: &Ocr, mut progress: impl FnMut(usize, usize) -> bool) -> Vec<OcrPage> {
+    pub fn run(self, ocr: &Ocr, progress: impl FnMut(usize, usize) -> bool) -> Vec<OcrPage> {
+        let mut out = Vec::new();
+        self.run_each(ocr, progress, |p| {
+            out.push(p);
+            true
+        });
+        out
+    }
+
+    /// Read the pages one at a time, handing each page's result to `each` as soon as it is read
+    /// (a skipped page included), so a caller can keep it before the next page starts.
+    /// `progress(done, total)` is called before each page and once at the end (as [`Self::run`]
+    /// calls it); `progress` or `each` returning `false` stops.
+    pub fn run_each(self, ocr: &Ocr, mut progress: impl FnMut(usize, usize) -> bool, mut each: impl FnMut(OcrPage) -> bool) {
         let config =
             RenderConfig { password: self.password.as_deref().map(Arc::from), hide_comments: self.settings.native_text_only, ..Default::default() };
         let mut r = PageRenderer::new(self.bytes.clone(), config);
-        let mut out = Vec::new();
         let total = self.pages.len();
         for (done, &page) in self.pages.iter().enumerate() {
             if !progress(done, total) {
@@ -128,37 +140,38 @@ impl OcrJob {
                 .text
                 .map(|t| t.glyphs.iter().filter(|g| !g.text.trim().is_empty()).map(|g| g.rect).collect())
                 .unwrap_or_default();
-            if self.settings.skip_text_pages && !existing.is_empty() {
-                out.push(skip("the page already contains text"));
-                continue;
-            }
-            let shot = r.render(RenderRequest { page, scale: self.scale(page, info), ..Default::default() });
-            if let Some(e) = shot.error {
-                out.push(skip(&e));
-                continue;
-            }
-            let lines = match ocr.recognize(&shot.rgba, shot.width, shot.height) {
-                Ok(l) => l,
-                Err(e) => {
-                    out.push(skip(&e.to_string()));
-                    continue;
-                }
+            let found = if self.settings.skip_text_pages && !existing.is_empty() {
+                skip("the page already contains text")
+            } else {
+                self.read_page(ocr, &mut r, page, info, &existing).unwrap_or_else(|why| skip(&why))
             };
-            let scale = shot.width as f32 / info.width.max(1e-3);
-            let to_user = |x: f32, y: f32| {
-                let [u, v] = info.view_to_user(x / scale, y / scale);
-                [u as f64, v as f64]
-            };
-            // Words the page's own text already has are not added a second time.
-            // Each line's words left to right as they stand (the order a page draws them in, which
-            // text extraction expects for right-to-left lines too).
-            let (fresh, already): (Vec<_>, Vec<_>) =
-                lines.iter().flat_map(|l| l.words_left_to_right()).partition(|w| covered(w.rect.map(|v| v / scale), &existing) < ALREADY_ON_PAGE);
-            let words = fresh.into_iter().map(|w| PlacedWord::place(w, to_user)).collect();
-            out.push(OcrPage { page, words, already_on_page: already.len(), skipped: None });
+            if !each(found) {
+                break;
+            }
         }
         progress(total, total);
-        out
+    }
+
+    /// Recognise `page` (shown by `r`): its words not already among the `existing` text boxes,
+    /// or why it could not be read.
+    fn read_page(&self, ocr: &Ocr, r: &mut PageRenderer, page: usize, info: &PageInfo, existing: &[[f32; 4]]) -> Result<OcrPage, String> {
+        let shot = r.render(RenderRequest { page, scale: self.scale(page, info), ..Default::default() });
+        if let Some(e) = shot.error {
+            return Err(e);
+        }
+        let lines = ocr.recognize(&shot.rgba, shot.width, shot.height).map_err(|e| e.to_string())?;
+        let scale = shot.width as f32 / info.width.max(1e-3);
+        let to_user = |x: f32, y: f32| {
+            let [u, v] = info.view_to_user(x / scale, y / scale);
+            [u as f64, v as f64]
+        };
+        // Words the page's own text already has are not added a second time.
+        // Each line's words left to right as they stand (the order a page draws them in, which
+        // text extraction expects for right-to-left lines too).
+        let (fresh, already): (Vec<_>, Vec<_>) =
+            lines.iter().flat_map(|l| l.words_left_to_right()).partition(|w| covered(w.rect.map(|v| v / scale), existing) < ALREADY_ON_PAGE);
+        let words = fresh.into_iter().map(|w| PlacedWord::place(w, to_user)).collect();
+        Ok(OcrPage { page, words, already_on_page: already.len(), skipped: None })
     }
 
     /// The render scale (pixels per point) `page` is read at. A scan is read at its own
@@ -208,6 +221,31 @@ impl Session {
             self.apply(id, Edit::Batch { label: "Recognize text".into(), edits })?;
         }
         Ok(words)
+    }
+
+    /// Add the words of one page found by [`OcrJob::run_each`] as soon as it is read, so the pages
+    /// done are kept whatever stops the run later. `joins`: an earlier page of the same run added
+    /// words already (and nothing was edited since), so this page joins that undo step and the
+    /// run is still undone as one step. Returns the number of words added.
+    pub fn apply_ocr_page(&mut self, id: DocId, found: &OcrPage, joins: bool) -> Result<usize, EditError> {
+        if found.words.is_empty() {
+            return Ok(0);
+        }
+        let edit = Edit::Batch { label: "Recognize text".into(), edits: vec![Edit::AddOcrText { page: found.page, words: found.words.clone() }] };
+        // The run's step (the state before its first page) is set aside while this page is
+        // applied, so the history never drops an older step on its account, and is put back in
+        // place of the step this page makes.
+        let first = if joins { self.doc_mut(id)?.editor.as_mut().and_then(|e| e.undo.pop()) } else { None };
+        let applied = self.apply(id, edit);
+        if let Some(first) = first
+            && let Some(editor) = self.doc_mut(id)?.editor.as_mut()
+        {
+            if applied.is_ok() {
+                editor.undo.pop();
+            }
+            editor.undo.push(first);
+        }
+        applied.map(|()| found.words.len())
     }
 
     /// Recognise text on `pages` and add it, in one call (the CLI and agents use this).
@@ -305,6 +343,48 @@ mod tests {
                 assert!(near(shot.width, want[0]) && near(shot.height, want[1]), "{dpi} dpi, page {page}: {}x{}", shot.width, shot.height);
             }
         }
+    }
+
+    /// Each page's words are added as soon as the page is read, so a run stopped (cancelled,
+    /// failed, killed) keeps the pages done; the pages of one run are still undone as one step,
+    /// and an edit made before the run stays.
+    #[test]
+    fn pages_added_one_at_a_time_are_kept_and_undone_as_one_step() {
+        let mut s = Session::new();
+        let png = export::encode_png(300, 300, &vec![255; 300 * 300 * 4]).unwrap();
+        let bytes = s.create_from_images(&[("a.png".into(), png.clone()), ("b.png".into(), png.clone()), ("c.png".into(), png)]).unwrap();
+        let id = s.open("scan.pdf", None, bytes, None).unwrap();
+        let texts = |s: &Session| -> Vec<String> {
+            let mut r = PageRenderer::new(s.get(id).unwrap().bytes.clone(), RenderConfig::default());
+            (0..3)
+                .map(|page| {
+                    let t = r.render(RenderRequest { page, kind: RequestKind::Text, scale: 1.0, ..Default::default() }).text;
+                    t.map(|t| t.plain_text().trim().to_string()).unwrap_or_default()
+                })
+                .collect()
+        };
+        let found = |page: usize, text: &str| OcrPage {
+            page,
+            words: vec![PlacedWord { text: text.into(), origin: [20.0, 100.0], across: [80.0, 0.0], up: [0.0, 12.0] }],
+            already_on_page: 0,
+            skipped: None,
+        };
+        let untitled = s.get(id).unwrap().info.title.clone();
+        s.apply(id, Edit::SetInfo { key: "Title".into(), value: "Site scan".into() }).unwrap();
+        assert_eq!(s.apply_ocr_page(id, &found(0, "first"), false).unwrap(), 1);
+        // The words are in the document at once: a run stopped here keeps page 1.
+        assert_eq!(texts(&s), ["first", "", ""]);
+        // A page read with nothing on it (or skipped) adds nothing and no step.
+        let empty = OcrPage { page: 1, words: Vec::new(), already_on_page: 0, skipped: Some("the page already contains text".into()) };
+        assert_eq!(s.apply_ocr_page(id, &empty, true).unwrap(), 0);
+        assert_eq!(s.apply_ocr_page(id, &found(2, "third"), true).unwrap(), 1);
+        assert_eq!(texts(&s), ["first", "", "third"]);
+        // One undo takes the whole run back; the edit before it stays.
+        s.undo(id).unwrap();
+        assert_eq!(texts(&s), ["", "", ""]);
+        assert_eq!(s.get(id).unwrap().info.title.as_deref(), Some("Site scan"));
+        s.undo(id).unwrap();
+        assert_eq!(s.get(id).unwrap().info.title, untitled);
     }
 
     #[test]

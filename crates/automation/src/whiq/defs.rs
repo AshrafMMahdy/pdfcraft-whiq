@@ -291,7 +291,7 @@ pub fn definitions() -> Vec<Value> {
         tool(
             "ocr",
             "OCR to a searchable PDF",
-            "Recognise the text of pages (default: every page without a text layer; skip_text_pages: false reads all) and add it as an invisible text layer over the page image, so a scanned PDF becomes searchable and selectable; the picture is unchanged. With save_to the searchable PDF is saved there (else save_document later). Answers {document, pages_read, pages_skipped, words, saved?}. Reads the Latin alphabet, and Arabic (with the Latin words and numbers among it) when the Arabic model is installed beside the binary, telling them apart line by line with no setting; Arabic is stored in typed order.",
+            "Recognise the text of pages (default: every page without a text layer; skip_text_pages: false reads all) and add it as an invisible text layer over the page image, so a scanned PDF becomes searchable and selectable; the picture is unchanged. With save_to the searchable PDF is saved there (else save_document later). Answers {document, words, pages: [{page, words, text} or {page, skipped}], saved?}. Pages are read one at a time: progress counts them, and each page's text is added as soon as it is read, so a cancel or a failure keeps the pages done and answers pages_done, pages_remaining and continue_with {pages} (call ocr with those pages to read only the rest). Reads the Latin alphabet, and Arabic (with the Latin words and numbers among it) when the Arabic model is installed beside the binary, telling them apart line by line with no setting; Arabic is stored in typed order.",
             obj(
                 json!({
                     "document": document(),

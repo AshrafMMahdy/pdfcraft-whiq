@@ -192,29 +192,20 @@ impl Session {
         let mut out = Vec::new();
         for d in &mut self.docs {
             if d.dirty && d.generation != d.snapshot_generation {
-                // The working bytes hold typed Password-field values (#3926, #3944): a recovery file
-                // is written from a copy without them, and none is written if that copy fails.
-                let bytes =
-                    match d.editor.as_ref().filter(|e| pdfcraft_forms::has_password_values(&e.cos) || pdfcraft_xfa::has_password_values(&e.cos)) {
-                        Some(e) => match writable(&e.cos)
-                            .and_then(|c| write_incremental(&c, &SaveOptions::default()).map_err(|e| EditError::Write(e.to_string())))
-                        {
-                            Ok(b) => Arc::new(b),
-                            Err(_) => continue,
-                        },
-                        None => d.bytes.clone(),
-                    };
+                let Some(snap) = recovery_snapshot(d) else { continue };
                 d.snapshot_generation = d.generation;
-                out.push(RecoverySnapshot {
-                    doc: d.id,
-                    name: d.name.clone(),
-                    path: d.path.clone(),
-                    bytes,
-                    encrypted: d.info.encrypted || d.editor.as_ref().is_some_and(|e| e.cos.security().is_some()),
-                });
+                out.push(snap);
             }
         }
         out
+    }
+
+    /// Document `id`'s working file now, for crash recovery, as [`Self::autosave_snapshots`]
+    /// takes it, without marking it taken: for a caller that keeps its own record (by
+    /// [`crate::Document::generation`]). `None` when the document is not open or its copy without
+    /// typed passwords cannot be made.
+    pub fn recovery_snapshot(&self, id: DocId) -> Option<RecoverySnapshot> {
+        self.get(id).and_then(recovery_snapshot)
     }
 
     /// Mark a document opened from a recovery file: it has unsaved changes and belongs at
@@ -335,4 +326,23 @@ impl Session {
         }
         Ok(())
     }
+}
+
+/// `d`'s working file for crash recovery. The working bytes hold typed Password-field values
+/// (#3926, #3944): a recovery file is written from a copy without them, and none is written if
+/// that copy fails.
+fn recovery_snapshot(d: &super::Document) -> Option<RecoverySnapshot> {
+    let bytes = match d.editor.as_ref().filter(|e| pdfcraft_forms::has_password_values(&e.cos) || pdfcraft_xfa::has_password_values(&e.cos)) {
+        Some(e) => {
+            Arc::new(writable(&e.cos).and_then(|c| write_incremental(&c, &SaveOptions::default()).map_err(|e| EditError::Write(e.to_string()))).ok()?)
+        }
+        None => d.bytes.clone(),
+    };
+    Some(RecoverySnapshot {
+        doc: d.id,
+        name: d.name.clone(),
+        path: d.path.clone(),
+        bytes,
+        encrypted: d.info.encrypted || d.editor.as_ref().is_some_and(|e| e.cos.security().is_some()),
+    })
 }

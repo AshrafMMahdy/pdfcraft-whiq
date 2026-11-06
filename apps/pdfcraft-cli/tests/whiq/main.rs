@@ -855,6 +855,192 @@ fn checkpoints_write_the_recovered_file_while_editing() {
     assert_eq!(st["checkpoints"]["files"], json!([]));
 }
 
+const HOOKS: [(&str, &str); 1] = [("PDFCRAFT_MCP_TEST_HOOKS", "1")];
+
+/// The recovered files in the write root.
+fn recovered_files(s: &Server) -> Vec<PathBuf> {
+    std::fs::read_dir(s.out()).unwrap().flatten().map(|e| e.path()).filter(|p| p.to_string_lossy().contains(".recovered-")).collect()
+}
+
+/// Wait up to `ms` for a recovered file to appear.
+fn wait_recovered(s: &Server, ms: u64) -> Option<PathBuf> {
+    for _ in 0..ms / 50 {
+        if let Some(p) = recovered_files(s).into_iter().next() {
+            return Some(p);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    None
+}
+
+/// A text-layer read of a PDF, OCR off.
+fn page_texts(s: &mut Server, path: &Path) -> Vec<String> {
+    let r = s.ok("read", json!({"path": path, "format": "text", "ocr": "off"}));
+    r["pages"].as_array().unwrap().iter().map(|p| p["text"].as_str().unwrap_or_default().trim().to_string()).collect()
+}
+
+#[test]
+fn a_panic_mid_edit_puts_the_document_back_and_releases_only_it() {
+    let mut s = Server::start_env(&[], &HOOKS);
+    let r = make_report(&mut s);
+    let doc = r["document"].clone();
+    s.ok("edit", json!({"document": doc, "ops": [{"op": "add_text", "page": 1, "text": "Typed before the call", "at": [72, 700]}]}));
+    let other = s.ok("new_document", json!({"name": "other.pdf"}))["document"].clone();
+    s.ok("edit", json!({"document": other, "ops": [{"op": "add_text", "page": 1, "text": "Work in the other document", "at": [72, 700]}]}));
+    let e = s.err(
+        "edit",
+        json!({"document": doc, "ops": [{"op": "add_text", "page": 1, "text": "Half of the batch", "at": [72, 650]}, {"op": "__panic"}]}),
+    );
+    assert_eq!(e["code"], "internal", "{e}");
+    assert_eq!(e["applied"], json!(false), "{e}");
+    assert!(e["reason"].as_str().unwrap().contains("Nothing of the call was applied"), "{e}");
+    // Only the document the call worked on was released, auto-saved as it was before the call.
+    let released = e["evicted"]["evicted"].as_array().unwrap();
+    assert_eq!(released.len(), 1, "{e}");
+    assert_eq!(released[0]["document"], doc, "{e}");
+    let rec = PathBuf::from(released[0]["recovered_path"].as_str().unwrap());
+    let text = page_texts(&mut s, &rec).join(" ");
+    assert!(text.contains("Typed before the call") && !text.contains("Half of the batch"), "{text}");
+    // The other document is still open with its unsaved work.
+    let o = s.ok("read", json!({"document": other, "format": "text", "ocr": "off"}));
+    assert!(o["pages"][0]["text"].as_str().unwrap().contains("Work in the other document"), "{o}");
+    // Retrying once on the reopened file applies the batch once.
+    let back = s.ok("open_document", json!({"path": rec}))["document"].clone();
+    s.ok("edit", json!({"document": back, "ops": [{"op": "add_text", "page": 1, "text": "Half of the batch", "at": [72, 650]}]}));
+    let t = s.ok("read", json!({"document": back, "format": "text", "ocr": "off"}))["pages"][0]["text"].as_str().unwrap().to_string();
+    assert_eq!(t.matches("Half of the batch").count(), 1, "{t}");
+}
+
+#[test]
+fn the_checkpoint_timer_saves_while_a_long_call_runs() {
+    let mut s = Server::start_env(&["--checkpoint-secs", "1"], &HOOKS);
+    make_report(&mut s);
+    s.ok("edit", json!({"ops": [{"op": "add_text", "page": 1, "text": "Typed before the long call", "at": [72, 700]}]}));
+    let r = s.request("tools/call", json!({"name": "__sleep", "arguments": {"ms": 6000, "async": true}}));
+    let job = r["result"]["structuredContent"]["job_id"].as_str().unwrap().to_string();
+    let rec = wait_recovered(&s, 4000).expect("a checkpoint while the call runs");
+    assert_eq!(s.ok("job_status", json!({"job_id": job}))["status"], "running");
+    let st = s.ok("server_status", json!({}));
+    let listed = Path::new(st["checkpoints"]["files"][0]["path"].as_str().unwrap()).file_name().map(|n| n.to_owned());
+    assert_eq!(listed.as_deref(), rec.file_name(), "{st}");
+    let text = page_texts(&mut s, &rec).join(" ");
+    assert!(text.contains("Typed before the long call"), "{text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn sigterm_during_a_long_call_saves_unsaved_work_at_once() {
+    let mut s = Server::start_env(&[], &HOOKS);
+    make_report(&mut s);
+    s.ok("edit", json!({"ops": [{"op": "add_text", "page": 1, "text": "Typed before SIGTERM", "at": [72, 700]}]}));
+    s.request("tools/call", json!({"name": "__sleep", "arguments": {"ms": 60000, "async": true}}));
+    let pid = s.child.id().to_string();
+    assert!(Command::new("kill").args(["-TERM", &pid]).status().unwrap().success());
+    let mut code = None;
+    for _ in 0..200 {
+        if let Some(st) = s.child.try_wait().unwrap() {
+            code = st.code();
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(code, Some(143), "the server did not stop at once on SIGTERM during a call");
+    let found = recovered_files(&s);
+    assert_eq!(found.len(), 1, "{found:?}");
+    let mut t = Server::start(&[]);
+    let back = t.inp().join("back.pdf");
+    std::fs::copy(&found[0], &back).unwrap();
+    let text = page_texts(&mut t, &back).join(" ");
+    assert!(text.contains("Typed before SIGTERM"), "{text}");
+}
+
+#[test]
+fn hang_up_during_a_long_call_saves_at_once_and_again_when_it_ends() {
+    let mut s = Server::start_env(&[], &HOOKS);
+    make_report(&mut s);
+    s.ok("edit", json!({"ops": [{"op": "add_text", "page": 1, "text": "Typed before the hang-up", "at": [72, 700]}]}));
+    let id = s.next;
+    s.next += 1;
+    s.send(&json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {"name": "__sleep", "arguments": {"ms": 6000}}}));
+    std::thread::sleep(Duration::from_millis(300));
+    s.close_stdin();
+    // Saved while the call still runs, not after it.
+    let rec = wait_recovered(&s, 4000).expect("auto-saved at the hang-up");
+    assert!(s.child.try_wait().unwrap().is_none(), "the running call is let finish");
+    s.wait_exit();
+    assert_eq!(recovered_files(&s), vec![rec.clone()], "one file per document: the final save goes over it");
+    let mut t = Server::start(&[]);
+    let back = t.inp().join("back.pdf");
+    std::fs::copy(&rec, &back).unwrap();
+    let text = page_texts(&mut t, &back).join(" ");
+    assert!(text.contains("Typed before the hang-up"), "{text}");
+}
+
+/// `ocr` goes page by page: progress counts pages, each page's text is added as it is read, and
+/// a cancel or a panic keeps the pages done and names the ones left (`pages` reads only those).
+#[test]
+fn ocr_keeps_each_page_as_it_is_read_through_cancel_and_panic() {
+    if !models_present() {
+        eprintln!("skipped: no OCR models (cargo xtask models)");
+        return;
+    }
+    let mut s = Server::start_env(&[], &HOOKS);
+    let md = "# Alpha Concrete Record\n\nThe slab on level one was poured on Monday.\n\n\\pagebreak\n\n# Bravo Formwork Record\n\nThe columns on level two were struck on Tuesday.\n\n\\pagebreak\n\n# Charlie Steel Record\n\nThe bars on level three were fixed on Wednesday.\n";
+    let r = s.ok("convert", json!({"markdown": md, "path": "src.pdf", "font_size": 16}));
+    assert_eq!(r["pages"], json!(3), "{r}");
+    let shot = s.ok("render_preview", json!({"document": r["document"], "pages": "1-3", "format": "png", "dpi": 150, "out_dir": "scan"}));
+    let mut inputs = Vec::new();
+    for (i, p) in shot["pages"].as_array().unwrap().iter().enumerate() {
+        let name = format!("scan-{}.png", i + 1);
+        std::fs::copy(p["path"].as_str().unwrap(), s.inp().join(&name)).unwrap();
+        inputs.push(name);
+    }
+    let scan = s.ok("convert", json!({"inputs": inputs, "path": "scan.pdf"}));
+    let doc = scan["document"].clone();
+    let has_text = |s: &mut Server, doc: &Value| -> Vec<bool> {
+        let r = s.ok("read", json!({"document": doc, "format": "text", "ocr": "off"}));
+        r["pages"].as_array().unwrap().iter().map(|p| !p["text"].as_str().unwrap_or_default().trim().is_empty()).collect()
+    };
+    assert_eq!(has_text(&mut s, &doc), [false, false, false]);
+
+    // Cancelled after the first page: page 1 keeps its text, pages 2-3 are named as left.
+    let e = s.err("ocr", json!({"document": doc, "__stop_after_pages": 1}));
+    assert_eq!(e["code"], "cancelled", "{e}");
+    assert_eq!(e["pages_done"], json!([1]), "{e}");
+    assert_eq!(e["pages_remaining"], json!([2, 3]), "{e}");
+    assert_eq!(e["continue_with"], json!({"pages": "2-3"}), "{e}");
+    assert!(e["next_step"].as_str().unwrap().contains("pages: \"2-3\""), "{e}");
+    assert_eq!(has_text(&mut s, &doc), [true, false, false]);
+
+    // The rest, as a job: progress counts the pages.
+    let r = s.request("tools/call", json!({"name": "ocr", "arguments": {"document": doc, "pages": "2-3", "async": true}}));
+    let job = r["result"]["structuredContent"]["job_id"].as_str().unwrap().to_string();
+    let done = loop {
+        let j = s.ok("job_status", json!({"job_id": job}));
+        if j["status"] != "running" {
+            break j;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(done["status"], "done", "{done}");
+    assert_eq!(done["stage"], "recognising text", "{done}");
+    assert_eq!(done["steps"], json!({"done": 2, "total": 2, "unit": "pages"}), "{done}");
+    assert_eq!(done["result"]["pages"].as_array().unwrap().len(), 2, "{done}");
+    assert_eq!(has_text(&mut s, &doc), [true, true, true]);
+    // The whole recognition is one undo step per call: undo takes back pages 2-3 only.
+    s.ok("edit", json!({"document": doc, "ops": [{"op": "undo"}]}));
+    assert_eq!(has_text(&mut s, &doc), [true, false, false]);
+
+    // A panic after page 2 of the rest: what was read is in the recovered file.
+    let e = s.err("ocr", json!({"document": doc, "pages": "2-3", "__panic_after_pages": 1}));
+    assert_eq!(e["code"], "internal", "{e}");
+    assert_eq!(e["pages_done"], json!([2]), "{e}");
+    assert_eq!(e["pages_remaining"], json!([3]), "{e}");
+    let rec = PathBuf::from(e["evicted"]["evicted"][0]["recovered_path"].as_str().unwrap());
+    let texts = page_texts(&mut s, &rec);
+    assert_eq!(texts.iter().map(|t| !t.is_empty()).collect::<Vec<_>>(), [true, true, false], "{texts:?}");
+}
+
 // ---- a large file ----------------------------------------------------------------------------
 
 #[test]
