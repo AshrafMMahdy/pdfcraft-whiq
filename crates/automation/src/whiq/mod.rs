@@ -757,7 +757,7 @@ fn cancel(shared: &Shared, id: Option<&Value>) -> Value {
     j.ctx.cancel.store(true, Ordering::SeqCst);
     ok_result(
         &json!({"cancelled": true, "status": "cancelling", "job_id": job_name(n), "tool": j.tool, "retry_after_ms": 200,
-                "next_step": "the call stops at its next step (an edit batch leaves the document as it was before it; ocr keeps the pages it read); job_status shows when and what was kept"}),
+                "next_step": "the call stops at its next step (an edit batch leaves the document as it was before it; ocr keeps the pages it read; read answers the pages it read with continue_from); job_status shows when and what was kept"}),
         &[],
     )
 }

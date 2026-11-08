@@ -1,5 +1,7 @@
 //! `read`: pages as structured text, in windows, with OCR for pages that have no text layer.
 
+use std::sync::atomic::Ordering;
+
 use serde_json::{Map, Value, json};
 
 use super::contract::{WhiqError, code, parse_pages};
@@ -44,7 +46,15 @@ pub fn read(e: &mut Engine, a: &Map<String, Value>, ctx: &Ctx) -> Res<Reply> {
     let mut ocr_unavailable: Option<WhiqError> = None;
     let mut used = 600usize;
     let mut done = 0usize;
+    // A cancel after some pages keeps them: they are answered with continue_from (as the byte
+    // budget's cut is); a cancel before any page fails as cancelled.
+    let mut cancelled = false;
+    let stop_after = if e.settings.test_hooks { a.get("__stop_after_pages").and_then(Value::as_u64) } else { None };
     'windows: for window in rest.chunks(WINDOW) {
+        if done > 0 && ctx.cancelled() {
+            cancelled = true;
+            break 'windows;
+        }
         ctx.check()?;
         let texts = e.auto.page_texts(DocId(id), window).map_err(|err| super::contract::classify(&err.to_string(), "read"))?;
         let md = if markdown {
@@ -54,6 +64,10 @@ pub fn read(e: &mut Engine, a: &Map<String, Value>, ctx: &Ctx) -> Res<Reply> {
             Vec::new()
         };
         for (k, &p) in window.iter().enumerate() {
+            if done > 0 && ctx.cancelled() {
+                cancelled = true;
+                break 'windows;
+            }
             ctx.check()?;
             let layer = texts.get(k);
             let has_text = layer.is_some_and(|t| t.glyphs.iter().any(|g| !g.text.trim().is_empty()));
@@ -95,6 +109,9 @@ pub fn read(e: &mut Engine, a: &Map<String, Value>, ctx: &Ctx) -> Res<Reply> {
             out_pages.push(v);
             done += 1;
             ctx.step(done as u64);
+            if stop_after == Some(done as u64) {
+                ctx.cancel.store(true, Ordering::SeqCst);
+            }
         }
     }
     let mut v = json!({
@@ -116,10 +133,14 @@ pub fn read(e: &mut Engine, a: &Map<String, Value>, ctx: &Ctx) -> Res<Reply> {
         v["next_page"] = json!(selection.get(next).map(|p| p + 1));
         v["total"] = json!(selection.len());
         v["next_step"] = json!(format!(
-            "pages {} of {} asked for were read; call read again with the same arguments and continue_from: {next} for the rest",
+            "{}pages {} of {} asked for were read; call read again with the same arguments and continue_from: {next} for the rest",
+            if cancelled { "the call was cancelled: the pages read are kept here; " } else { "" },
             next,
             selection.len()
         ));
+        if cancelled {
+            v["cancelled"] = json!(true);
+        }
     }
     Ok(v.into())
 }

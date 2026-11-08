@@ -411,6 +411,60 @@ fn read_answers_in_windows_with_continue_from() {
     assert_eq!(seen, (1..=12).collect::<Vec<u64>>());
 }
 
+/// A `read` cancelled after some pages answers them with continue_from (never an error that drops
+/// them), at a window's start or inside one, as a direct answer or as a job's result; the next
+/// call continues from it.
+#[test]
+fn a_cancelled_read_keeps_the_pages_read_and_continues_from_the_next() {
+    let mut s = Server::start_env(&[], &HOOKS);
+    let md: String = (1..=12).map(|i| format!("# Chapter {i}\n\nThe body of chapter {i}.\n\n\\pagebreak\n\n")).collect();
+    let r = s.ok("convert", json!({"markdown": md, "path": "chapters.pdf"}));
+    assert_eq!(r["pages"], json!(12));
+    let doc = r["document"].clone();
+    let pages = |a: &Value| a["pages"].as_array().unwrap().iter().map(|p| p["page"].as_u64().unwrap()).collect::<Vec<_>>();
+
+    // Cancelled after 8 pages: the cancel is seen at the next window's start.
+    let a = s.ok("read", json!({"document": doc, "__stop_after_pages": 8}));
+    assert_eq!(pages(&a), (1..=8).collect::<Vec<u64>>(), "{a}");
+    assert!(a["pages"][7]["text"].as_str().unwrap().contains("The body of chapter 8."), "{a}");
+    assert_eq!(a["cancelled"], json!(true), "{a}");
+    assert_eq!(a["continue_from"], json!(8), "{a}");
+    assert_eq!(a["next_page"], json!(9), "{a}");
+    assert!(a["next_step"].as_str().unwrap().contains("cancelled") && a["next_step"].as_str().unwrap().contains("continue_from: 8"), "{a}");
+
+    // Cancelled after 2 more pages, inside a window, asked as a job: a job is done and its result
+    // is the pages read with continue_from (what the platform's reader reads); a job that ends
+    // before the server answers comes back as that result directly.
+    let r = s.request("tools/call", json!({"name": "read", "arguments": {"document": doc, "continue_from": 8, "__stop_after_pages": 2, "async": true}}));
+    let a = match r["result"]["structuredContent"]["job_id"].as_str() {
+        Some(job) => {
+            let job = job.to_string();
+            let j = loop {
+                let j = s.ok("job_status", json!({"job_id": job}));
+                if j["status"] != "running" {
+                    break j;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            };
+            assert_eq!(j["status"], "done", "{j}");
+            j["result"].clone()
+        }
+        None => {
+            assert_ne!(r["result"]["isError"], json!(true), "{r}");
+            r["result"]["structuredContent"].clone()
+        }
+    };
+    assert_eq!(pages(&a), [9, 10], "{a}");
+    assert_eq!(a["cancelled"], json!(true), "{a}");
+    assert_eq!(a["continue_from"], json!(10), "{a}");
+    assert_eq!(a["next_page"], json!(11), "{a}");
+
+    // The next call reads the rest.
+    let a = s.ok("read", json!({"document": doc, "continue_from": 10}));
+    assert_eq!(pages(&a), [11, 12], "{a}");
+    assert!(a.get("continue_from").is_none() && a.get("cancelled").is_none(), "{a}");
+}
+
 #[test]
 fn scanned_pages_are_read_by_ocr_and_ocr_makes_them_searchable() {
     if !models_present() {
