@@ -1,10 +1,11 @@
 //! `read`: pages as structured text, in windows, with OCR for pages that have no text layer.
 
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::Ordering;
 
 use serde_json::{Map, Value, json};
 
-use super::contract::{WhiqError, code, parse_pages};
+use super::contract::{WhiqError, code, one_based, page_spec, parse_pages};
 use super::engine::{Ctx, Engine, Reply, Res, handle};
 use pdfcraft_engine::DocId;
 use pdfcraft_render::RenderRequest;
@@ -46,73 +47,92 @@ pub fn read(e: &mut Engine, a: &Map<String, Value>, ctx: &Ctx) -> Res<Reply> {
     let mut ocr_unavailable: Option<WhiqError> = None;
     let mut used = 600usize;
     let mut done = 0usize;
-    // A cancel after some pages keeps them: they are answered with continue_from (as the byte
-    // budget's cut is); a cancel before any page fails as cancelled.
-    let mut cancelled = false;
-    let stop_after = if e.settings.test_hooks { a.get("__stop_after_pages").and_then(Value::as_u64) } else { None };
-    'windows: for window in rest.chunks(WINDOW) {
-        if done > 0 && ctx.cancelled() {
-            cancelled = true;
-            break 'windows;
-        }
-        ctx.check()?;
-        let texts = e.auto.page_texts(DocId(id), window).map_err(|err| super::contract::classify(&err.to_string(), "read"))?;
-        let md = if markdown {
-            let (pages, _) = e.doc(id)?.export_pages_window(window, false);
-            pdfcraft_export::markdown_pages(&pages)
-        } else {
-            Vec::new()
-        };
-        for (k, &p) in window.iter().enumerate() {
-            if done > 0 && ctx.cancelled() {
-                cancelled = true;
-                break 'windows;
-            }
+    // A stop after some pages (a cancel, a failure, a panic) keeps them: they are answered with
+    // continue_from, as the byte budget's cut is, and `stopped` says why; a stop before any page
+    // fails the call as before.
+    let mut stopped: Option<(&str, Option<WhiqError>)> = None;
+    let hooks = e.settings.test_hooks;
+    let hook = |k: &str| if hooks { a.get(k).and_then(Value::as_u64) } else { None };
+    let (stop_after, fail_after, panic_after) = (hook("__stop_after_pages"), hook("__fail_after_pages"), hook("__panic_after_pages"));
+    for window in rest.chunks(WINDOW) {
+        // Whether to go on to the next window (false: the byte budget is spent).
+        let ran = std::panic::catch_unwind(AssertUnwindSafe(|| -> Res<bool> {
             ctx.check()?;
-            let layer = texts.get(k);
-            let has_text = layer.is_some_and(|t| t.glyphs.iter().any(|g| !g.text.trim().is_empty()));
-            let want_ocr = match ocr_mode.as_str() {
-                "off" => false,
-                "force" => true,
-                _ => !has_text,
+            let texts = e.auto.page_texts(DocId(id), window).map_err(|err| super::contract::classify(&err.to_string(), "read"))?;
+            let md = if markdown {
+                let (pages, _) = e.doc(id)?.export_pages_window(window, false);
+                pdfcraft_export::markdown_pages(&pages)
+            } else {
+                Vec::new()
             };
-            let mut entry = Map::new();
-            entry.insert("page".into(), json!(p + 1));
-            let mut text = if markdown { md.get(k).cloned().unwrap_or_default() } else { layer.map(|t| ordered_text(t)).unwrap_or_default() };
-            if want_ocr && ocr_unavailable.is_none() {
-                match ocr_page(e, id, p, ocr_dpi) {
-                    Ok(t) => {
-                        text = t;
-                        entry.insert("ocr".into(), json!(true));
-                        ocr_pages.push(p + 1);
-                    }
-                    Err(err) if err.code == code::NOT_AVAILABLE => ocr_unavailable = Some(err),
-                    Err(err) => {
-                        entry.insert("ocr_error".into(), err.object());
+            for (k, &p) in window.iter().enumerate() {
+                ctx.check()?;
+                if fail_after == Some(done as u64) {
+                    return Err(WhiqError::failed("test hook: a failure in read", "call read again"));
+                }
+                if panic_after == Some(done as u64) {
+                    super::engine::test_hook_panic("read");
+                }
+                let layer = texts.get(k);
+                let has_text = layer.is_some_and(|t| t.glyphs.iter().any(|g| !g.text.trim().is_empty()));
+                let want_ocr = match ocr_mode.as_str() {
+                    "off" => false,
+                    "force" => true,
+                    _ => !has_text,
+                };
+                let mut entry = Map::new();
+                entry.insert("page".into(), json!(p + 1));
+                let mut text = if markdown { md.get(k).cloned().unwrap_or_default() } else { layer.map(|t| ordered_text(t)).unwrap_or_default() };
+                if want_ocr && ocr_unavailable.is_none() {
+                    match ocr_page(e, id, p, ocr_dpi) {
+                        Ok(t) => {
+                            text = t;
+                            entry.insert("ocr".into(), json!(true));
+                            ocr_pages.push(p + 1);
+                        }
+                        Err(err) if err.code == code::NOT_AVAILABLE => ocr_unavailable = Some(err),
+                        Err(err) => {
+                            entry.insert("ocr_error".into(), err.object());
+                        }
                     }
                 }
+                if markdown {
+                    entry.insert("tables".into(), json!(text.lines().filter(|l| l.starts_with("|") && l.contains(" --- |")).count()));
+                }
+                entry.insert("chars".into(), json!(text.chars().count()));
+                if !has_text && !entry.contains_key("ocr") {
+                    entry.insert("no_text_layer".into(), json!(true));
+                }
+                entry.insert("text".into(), json!(text));
+                let v = Value::Object(entry);
+                let n = v.to_string().len() + 1;
+                if !out_pages.is_empty() && used + n > budget {
+                    return Ok(false);
+                }
+                used += n;
+                out_pages.push(v);
+                done += 1;
+                ctx.step(done as u64);
+                if stop_after == Some(done as u64) {
+                    ctx.cancel.store(true, Ordering::SeqCst);
+                }
             }
-            if markdown {
-                entry.insert("tables".into(), json!(text.lines().filter(|l| l.starts_with("|") && l.contains(" --- |")).count()));
-            }
-            entry.insert("chars".into(), json!(text.chars().count()));
-            if !has_text && !entry.contains_key("ocr") {
-                entry.insert("no_text_layer".into(), json!(true));
-            }
-            entry.insert("text".into(), json!(text));
-            let v = Value::Object(entry);
-            let n = v.to_string().len() + 1;
-            if !out_pages.is_empty() && used + n > budget {
-                break 'windows;
-            }
-            used += n;
-            out_pages.push(v);
-            done += 1;
-            ctx.step(done as u64);
-            if stop_after == Some(done as u64) {
-                ctx.cancel.store(true, Ordering::SeqCst);
+            Ok(true)
+        }));
+        match ran {
+            Ok(Ok(true)) => continue,
+            Ok(Ok(false)) => {}
+            Ok(Err(err)) if done == 0 => return Err(err),
+            Ok(Err(err)) if err.code == code::CANCELLED => stopped = Some(("cancelled", None)),
+            Ok(Err(err)) => stopped = Some(("failed", Some(err))),
+            // A panic before any page is the call's (the worker releases what it opened).
+            Err(p) if done == 0 => std::panic::resume_unwind(p),
+            Err(p) => {
+                let msg = p.downcast_ref::<&str>().map(ToString::to_string).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_else(|| "panic".into());
+                stopped = Some(("panic", Some(WhiqError::new(code::INTERNAL, format!("read failed inside the engine: {msg}"), "call read again"))));
             }
         }
+        break;
     }
     let mut v = json!({
         "document": handle(id),
@@ -132,14 +152,17 @@ pub fn read(e: &mut Engine, a: &Map<String, Value>, ctx: &Ctx) -> Res<Reply> {
         v["continue_from"] = json!(next);
         v["next_page"] = json!(selection.get(next).map(|p| p + 1));
         v["total"] = json!(selection.len());
-        v["next_step"] = json!(format!(
-            "{}pages {} of {} asked for were read; call read again with the same arguments and continue_from: {next} for the rest",
-            if cancelled { "the call was cancelled: the pages read are kept here; " } else { "" },
-            next,
-            selection.len()
-        ));
-        if cancelled {
-            v["cancelled"] = json!(true);
+        let again = format!("call read again with the same arguments and continue_from: {next} for the rest");
+        v["next_step"] = json!(format!("pages {} of {} asked for were read; {again}", next, selection.len()));
+        if let Some((why, err)) = stopped {
+            let read = page_spec(&one_based(selection.get(from..next).unwrap_or_default()));
+            let cause = err.as_ref().map_or_else(|| "the call was cancelled".to_string(), |err| err.reason.clone());
+            let fix = if err.is_some() { "fix it or " } else { "" };
+            v["stopped"] = json!(why);
+            if let Some(err) = err {
+                v["stop_error"] = err.object();
+            }
+            v["next_step"] = json!(format!("pages {read} were read and are kept here; {cause}; {fix}{again}"));
         }
     }
     Ok(v.into())

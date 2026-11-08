@@ -427,7 +427,7 @@ fn a_cancelled_read_keeps_the_pages_read_and_continues_from_the_next() {
     let a = s.ok("read", json!({"document": doc, "__stop_after_pages": 8}));
     assert_eq!(pages(&a), (1..=8).collect::<Vec<u64>>(), "{a}");
     assert!(a["pages"][7]["text"].as_str().unwrap().contains("The body of chapter 8."), "{a}");
-    assert_eq!(a["cancelled"], json!(true), "{a}");
+    assert_eq!(a["stopped"], json!("cancelled"), "{a}");
     assert_eq!(a["continue_from"], json!(8), "{a}");
     assert_eq!(a["next_page"], json!(9), "{a}");
     assert!(a["next_step"].as_str().unwrap().contains("cancelled") && a["next_step"].as_str().unwrap().contains("continue_from: 8"), "{a}");
@@ -455,14 +455,70 @@ fn a_cancelled_read_keeps_the_pages_read_and_continues_from_the_next() {
         }
     };
     assert_eq!(pages(&a), [9, 10], "{a}");
-    assert_eq!(a["cancelled"], json!(true), "{a}");
+    assert_eq!(a["stopped"], json!("cancelled"), "{a}");
     assert_eq!(a["continue_from"], json!(10), "{a}");
     assert_eq!(a["next_page"], json!(11), "{a}");
 
     // The next call reads the rest.
     let a = s.ok("read", json!({"document": doc, "continue_from": 10}));
     assert_eq!(pages(&a), [11, 12], "{a}");
-    assert!(a.get("continue_from").is_none() && a.get("cancelled").is_none(), "{a}");
+    assert!(a.get("continue_from").is_none() && a.get("stopped").is_none(), "{a}");
+}
+
+/// A `read` that fails after some pages (a page's text could not be read) answers the pages read
+/// with continue_from, stopped "failed" and the error; with no page read it fails as before.
+#[test]
+fn a_read_that_fails_after_some_pages_keeps_them() {
+    let mut s = Server::start_env(&[], &HOOKS);
+    let md: String = (1..=12).map(|i| format!("# Chapter {i}\n\nThe body of chapter {i}.\n\n\\pagebreak\n\n")).collect();
+    let doc = s.ok("convert", json!({"markdown": md, "path": "chapters.pdf"}))["document"].clone();
+    let pages = |a: &Value| a["pages"].as_array().unwrap().iter().map(|p| p["page"].as_u64().unwrap()).collect::<Vec<_>>();
+
+    let a = s.ok("read", json!({"document": doc, "__fail_after_pages": 3}));
+    assert_eq!(pages(&a), [1, 2, 3], "{a}");
+    assert!(a["pages"][2]["text"].as_str().unwrap().contains("The body of chapter 3."), "{a}");
+    assert_eq!(a["stopped"], json!("failed"), "{a}");
+    assert_eq!(a["stop_error"]["code"], json!("failed"), "{a}");
+    assert_eq!(a["stop_error"]["reason"], json!("test hook: a failure in read"), "{a}");
+    assert_eq!(a["continue_from"], json!(3), "{a}");
+    assert_eq!(a["next_page"], json!(4), "{a}");
+    let next = a["next_step"].as_str().unwrap();
+    assert!(next.starts_with("pages 1-3 were read and are kept here; test hook: a failure in read; fix it or call read again"), "{a}");
+    assert!(next.contains("continue_from: 3"), "{a}");
+
+    // The next call continues from it.
+    let a = s.ok("read", json!({"document": doc, "continue_from": 3}));
+    assert_eq!(pages(&a), (4..=12).collect::<Vec<u64>>(), "{a}");
+
+    // Nothing read yet: the call fails as before.
+    let e = s.err("read", json!({"document": doc, "__fail_after_pages": 0}));
+    assert_eq!(e["code"], "failed", "{e}");
+}
+
+/// A bug (a panic) inside `read` after some pages answers the pages read with continue_from,
+/// stopped "panic" and the cause, and the document stays open for the next call; a panic before
+/// any page is the call's, as every tool's.
+#[test]
+fn a_read_that_panics_after_some_pages_keeps_them() {
+    let mut s = Server::start_env(&[], &HOOKS);
+    let md: String = (1..=12).map(|i| format!("# Chapter {i}\n\nThe body of chapter {i}.\n\n\\pagebreak\n\n")).collect();
+    let doc = s.ok("convert", json!({"markdown": md, "path": "chapters.pdf"}))["document"].clone();
+    let pages = |a: &Value| a["pages"].as_array().unwrap().iter().map(|p| p["page"].as_u64().unwrap()).collect::<Vec<_>>();
+
+    let a = s.ok("read", json!({"document": doc, "__panic_after_pages": 9}));
+    assert_eq!(pages(&a), (1..=9).collect::<Vec<u64>>(), "{a}");
+    assert_eq!(a["stopped"], json!("panic"), "{a}");
+    assert_eq!(a["stop_error"]["code"], json!("internal"), "{a}");
+    assert!(a["stop_error"]["reason"].as_str().unwrap().contains("test hook: panic in read"), "{a}");
+    assert_eq!(a["continue_from"], json!(9), "{a}");
+    assert_eq!(a["next_page"], json!(10), "{a}");
+    assert!(a["next_step"].as_str().unwrap().starts_with("pages 1-9 were read and are kept here; read failed inside the engine"), "{a}");
+
+    let a = s.ok("read", json!({"document": doc, "continue_from": 9}));
+    assert_eq!(pages(&a), [10, 11, 12], "{a}");
+
+    let e = s.err("read", json!({"document": doc, "__panic_after_pages": 0}));
+    assert_eq!(e["code"], "internal", "{e}");
 }
 
 #[test]
