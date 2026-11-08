@@ -496,8 +496,9 @@ fn a_read_that_fails_after_some_pages_keeps_them() {
 }
 
 /// A bug (a panic) inside `read` after some pages answers the pages read with continue_from,
-/// stopped "panic" and the cause, and the document stays open for the next call; a panic before
-/// any page is the call's, as every tool's.
+/// stopped "panic" and the cause; the document is then released (its state after a panic is not
+/// trusted) and the next read reopens the file by path and reads the rest from it; a panic
+/// before any page is the call's, as every tool's.
 #[test]
 fn a_read_that_panics_after_some_pages_keeps_them() {
     let mut s = Server::start_env(&[], &HOOKS);
@@ -512,13 +513,71 @@ fn a_read_that_panics_after_some_pages_keeps_them() {
     assert!(a["stop_error"]["reason"].as_str().unwrap().contains("test hook: panic in read"), "{a}");
     assert_eq!(a["continue_from"], json!(9), "{a}");
     assert_eq!(a["next_page"], json!(10), "{a}");
-    assert!(a["next_step"].as_str().unwrap().starts_with("pages 1-9 were read and are kept here; read failed inside the engine"), "{a}");
+    let next = a["next_step"].as_str().unwrap();
+    assert!(next.starts_with("pages 1-9 were read and are kept here; read failed inside the engine"), "{a}");
+    assert!(next.contains(&format!("{} was closed so the next read starts clean: call read with path", doc.as_str().unwrap())), "{a}");
+    assert!(next.contains("continue_from: 9"), "{a}");
+    assert_eq!(a["evicted"]["evicted"][0]["document"], doc, "{a}");
+    let file = a["evicted"]["evicted"][0]["original_path"].as_str().unwrap().to_string();
 
-    let a = s.ok("read", json!({"document": doc, "continue_from": 9}));
+    // The document was released: its handle answers evicted; the file reopened by path gives
+    // the rest, read from a clean open.
+    let e = s.err("read", json!({"document": doc, "continue_from": 9}));
+    assert_eq!(e["code"], "evicted", "{e}");
+    let a = s.ok("read", json!({"path": file, "continue_from": 9}));
+    assert_ne!(a["document"], doc, "{a}");
     assert_eq!(pages(&a), [10, 11, 12], "{a}");
+    for (k, p) in a["pages"].as_array().unwrap().iter().enumerate() {
+        assert!(p["text"].as_str().unwrap().contains(&format!("The body of chapter {}.", k + 10)), "{a}");
+    }
+    assert!(a.get("stopped").is_none() && a.get("continue_from").is_none(), "{a}");
 
-    let e = s.err("read", json!({"document": doc, "__panic_after_pages": 0}));
+    let e = s.err("read", json!({"document": a["document"], "__panic_after_pages": 0}));
     assert_eq!(e["code"], "internal", "{e}");
+}
+
+/// A page OCR'd and then left out of the answer by the byte budget is not listed in ocr_pages and
+/// is not OCR'd again: the next call (continue_from) answers it from what was read.
+#[test]
+fn a_page_cut_by_the_byte_budget_is_not_ocrd_twice() {
+    if !models_present() {
+        eprintln!("skipped: no OCR models (cargo xtask models)");
+        return;
+    }
+    let mut s = Server::start_env(&[], &HOOKS);
+    let lines = ["The slab on level one was poured on Monday morning.", "The columns on level two were struck on Tuesday.", "The bars on level three were fixed on Wednesday."];
+    let body = |n: &str| format!("# {n} Site Record\n\n{}\n\n", lines.iter().map(|l| format!("{l} {l}")).collect::<Vec<_>>().join("\n\n"));
+    let md = ["Alpha", "Bravo", "Charlie"].iter().map(|n| body(n)).collect::<Vec<_>>().join("\\pagebreak\n\n");
+    let r = s.ok("convert", json!({"markdown": md, "path": "src.pdf", "font_size": 14}));
+    assert_eq!(r["pages"], json!(3), "{r}");
+    let shot = s.ok("render_preview", json!({"document": r["document"], "pages": "1-3", "format": "png", "dpi": 150, "out_dir": "scan"}));
+    let mut inputs = Vec::new();
+    for (i, p) in shot["pages"].as_array().unwrap().iter().enumerate() {
+        let name = format!("scan-{}.png", i + 1);
+        std::fs::copy(p["path"].as_str().unwrap(), s.inp().join(&name)).unwrap();
+        inputs.push(name);
+    }
+    let doc = s.ok("convert", json!({"inputs": inputs, "path": "scan.pdf"}))["document"].clone();
+    let pages = |a: &Value| a["pages"].as_array().unwrap().iter().map(|p| p["page"].as_u64().unwrap()).collect::<Vec<_>>();
+    let args = |from: u64| json!({"document": doc, "format": "text", "max_bytes": 1024, "continue_from": from, "__count_ocr": true});
+
+    // Page 1 fills the answer; page 2 is OCR'd, does not fit, and is kept for the next call.
+    let a = s.ok("read", args(0));
+    assert_eq!(pages(&a), [1], "{a}");
+    assert_eq!(a["ocr_pages"], json!([1]), "{a}");
+    assert_eq!(a["__ocr_runs"], json!(2), "{a}");
+    assert_eq!(a["continue_from"], json!(1), "{a}");
+    // Page 2 comes from what was read (no OCR); page 3 is OCR'd and kept in turn.
+    let a = s.ok("read", args(1));
+    assert_eq!(pages(&a), [2], "{a}");
+    assert_eq!(a["ocr_pages"], json!([2]), "{a}");
+    assert!(a["pages"][0]["text"].as_str().unwrap().contains("Bravo"), "{a}");
+    assert_eq!(a["__ocr_runs"], json!(1), "{a}");
+    let a = s.ok("read", args(2));
+    assert_eq!(pages(&a), [3], "{a}");
+    assert!(a["pages"][0]["text"].as_str().unwrap().contains("Charlie"), "{a}");
+    assert_eq!(a["__ocr_runs"], json!(0), "{a}");
+    assert!(a.get("continue_from").is_none(), "{a}");
 }
 
 #[test]

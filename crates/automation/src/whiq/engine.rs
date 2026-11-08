@@ -133,6 +133,10 @@ pub struct Engine {
     pub(crate) recovered_unreported: Vec<Value>,
     pub(crate) recovered_all: Vec<Value>,
     pub(crate) ocr: Option<Arc<pdfcraft_engine::ocr::Ocr>>,
+    /// The page a `read` OCR'd and then left out of its answer (the byte budget was spent):
+    /// (document, generation, page, dpi bits, text), so the next call answers it without
+    /// reading it again.
+    pub(crate) read_carry: Option<(u64, u64, usize, u64, String)>,
     /// SVG renderers per document, rebuilt when its displayed bytes change.
     pub(crate) svg: HashMap<u64, pdfcraft_render::SvgRenderer>,
     /// Who the running call is for: its `caller`, else `--author`. Comments carry it.
@@ -186,6 +190,7 @@ impl Engine {
             recovered_unreported: Vec::new(),
             recovered_all: Vec::new(),
             ocr: None,
+            read_carry: None,
             svg: HashMap::new(),
             caller: None,
             call_start: Vec::new(),

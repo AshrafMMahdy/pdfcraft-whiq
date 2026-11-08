@@ -54,6 +54,9 @@ pub fn read(e: &mut Engine, a: &Map<String, Value>, ctx: &Ctx) -> Res<Reply> {
     let hooks = e.settings.test_hooks;
     let hook = |k: &str| if hooks { a.get(k).and_then(Value::as_u64) } else { None };
     let (stop_after, fail_after, panic_after) = (hook("__stop_after_pages"), hook("__fail_after_pages"), hook("__panic_after_pages"));
+    let generation = e.doc(id)?.generation();
+    let carry_key = (id, generation, ocr_dpi.to_bits());
+    let mut ocr_runs = 0u64;
     for window in rest.chunks(WINDOW) {
         // Whether to go on to the next window (false: the byte budget is spent).
         let ran = std::panic::catch_unwind(AssertUnwindSafe(|| -> Res<bool> {
@@ -84,11 +87,18 @@ pub fn read(e: &mut Engine, a: &Map<String, Value>, ctx: &Ctx) -> Res<Reply> {
                 entry.insert("page".into(), json!(p + 1));
                 let mut text = if markdown { md.get(k).cloned().unwrap_or_default() } else { layer.map(|t| ordered_text(t)).unwrap_or_default() };
                 if want_ocr && ocr_unavailable.is_none() {
-                    match ocr_page(e, id, p, ocr_dpi) {
+                    let carried = e.read_carry.take_if(|c| (c.0, c.1, c.3) == carry_key && c.2 == p).map(|c| c.4);
+                    let read = match carried {
+                        Some(t) => Ok(t),
+                        None => {
+                            ocr_runs += 1;
+                            ocr_page(e, id, p, ocr_dpi)
+                        }
+                    };
+                    match read {
                         Ok(t) => {
                             text = t;
                             entry.insert("ocr".into(), json!(true));
-                            ocr_pages.push(p + 1);
                         }
                         Err(err) if err.code == code::NOT_AVAILABLE => ocr_unavailable = Some(err),
                         Err(err) => {
@@ -104,10 +114,18 @@ pub fn read(e: &mut Engine, a: &Map<String, Value>, ctx: &Ctx) -> Res<Reply> {
                     entry.insert("no_text_layer".into(), json!(true));
                 }
                 entry.insert("text".into(), json!(text));
+                let ocr = entry.contains_key("ocr");
                 let v = Value::Object(entry);
                 let n = v.to_string().len() + 1;
                 if !out_pages.is_empty() && used + n > budget {
+                    // Not in this answer: a page OCR'd is kept for the next call, not read twice.
+                    if ocr {
+                        e.read_carry = Some((carry_key.0, carry_key.1, p, carry_key.2, text));
+                    }
                     return Ok(false);
+                }
+                if ocr {
+                    ocr_pages.push(p + 1);
                 }
                 used += n;
                 out_pages.push(v);
@@ -134,6 +152,33 @@ pub fn read(e: &mut Engine, a: &Map<String, Value>, ctx: &Ctx) -> Res<Reply> {
         }
         break;
     }
+    let next = from + done;
+    // After a panic the read's state is not to be trusted: the document is released (auto-saved
+    // first if it has unsaved changes) and the OCR engine dropped, so the next read reopens the
+    // file clean.
+    let mut released = None;
+    if let Some(("panic", Some(err))) = &mut stopped {
+        e.ocr = None;
+        e.read_carry = None;
+        let r = e.evict(&[id], "panic");
+        let gone = &r["evicted"][0];
+        let file = gone["recovered_path"].as_str().or_else(|| gone["original_path"].as_str());
+        err.next_step = if gone["kept_open"] == json!(true) {
+            format!(
+                "{} could not be released ({}); call read again with the same arguments and continue_from: {next} for the rest",
+                handle(id),
+                gone["error"]["reason"].as_str().unwrap_or("its unsaved changes could not be saved")
+            )
+        } else if let Some(file) = file {
+            format!(
+                "{} was closed so the next read starts clean: call read with path: {file:?} (instead of the document), the same pages and other arguments, and continue_from: {next} for the rest",
+                handle(id)
+            )
+        } else {
+            format!("{} was closed and has no file to reopen; open it again and call read with continue_from: {next} for the rest", handle(id))
+        };
+        released = Some(r);
+    }
     let mut v = json!({
         "document": handle(id),
         "name": name,
@@ -146,7 +191,12 @@ pub fn read(e: &mut Engine, a: &Map<String, Value>, ctx: &Ctx) -> Res<Reply> {
     if let Some(err) = ocr_unavailable {
         v["ocr_unavailable"] = err.object();
     }
-    let next = from + done;
+    if let Some(r) = released {
+        v["evicted"] = r;
+    }
+    if hooks && a.contains_key("__count_ocr") {
+        v["__ocr_runs"] = json!(ocr_runs);
+    }
     if next < selection.len() {
         v["truncated"] = json!(true);
         v["continue_from"] = json!(next);
@@ -157,12 +207,16 @@ pub fn read(e: &mut Engine, a: &Map<String, Value>, ctx: &Ctx) -> Res<Reply> {
         if let Some((why, err)) = stopped {
             let read = page_spec(&one_based(selection.get(from..next).unwrap_or_default()));
             let cause = err.as_ref().map_or_else(|| "the call was cancelled".to_string(), |err| err.reason.clone());
-            let fix = if err.is_some() { "fix it or " } else { "" };
+            let then = match &err {
+                Some(err) if why == "panic" => err.next_step.clone(),
+                Some(_) => format!("fix it or {again}"),
+                None => again,
+            };
             v["stopped"] = json!(why);
             if let Some(err) = err {
                 v["stop_error"] = err.object();
             }
-            v["next_step"] = json!(format!("pages {read} were read and are kept here; {cause}; {fix}{again}"));
+            v["next_step"] = json!(format!("pages {read} were read and are kept here; {cause}; {then}"));
         }
     }
     Ok(v.into())
