@@ -3,8 +3,8 @@ name: Fuzz
 # Mutation fuzzing of open/render/edit/save (`cargo xtask fuzz`), nightly and on demand. Findings
 # are uploaded as an artifact; each real one becomes a synthetic regression test.
 on:
-  schedule:
-    - cron: "17 3 * * *"
+  # WHIQ fork: the upstream's scheduled run ("17 3 * * *") is switched off here (owner 2026-11-13):
+  # this fork does not use it; run it by hand with workflow_dispatch when wanted.
   workflow_dispatch:
 
 # The token is only used to check out the code: no job writes to the repository.

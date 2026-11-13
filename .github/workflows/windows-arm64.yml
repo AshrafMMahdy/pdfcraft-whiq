@@ -14,8 +14,8 @@ on:
       - "**/build.rs"
       - .github/workflows/windows-arm64.yml
       - packaging/windows/**
-  schedule:
-    - cron: "41 4 * * 1" # weekly, so drift in the runner images shows up
+  # WHIQ fork: the upstream's scheduled run ("41 4 * * 1") is switched off here (owner 2026-11-13):
+  # this fork does not use it; run it by hand with workflow_dispatch when wanted.
   workflow_dispatch:
 
 concurrency:
