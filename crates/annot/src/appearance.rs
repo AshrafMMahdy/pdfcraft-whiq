@@ -417,7 +417,7 @@ impl<'a> Writer<'a> {
 
     /// The `/Font` resources for what this writer wrote: Helvetica, and the face when it is used.
     fn resource(&self) -> Object {
-        let Object::Dict(mut fonts) = helvetica_resource() else { unreachable!("helvetica_resource is a dictionary") };
+        let mut fonts = helvetica_fonts();
         if let Some(f) = self.0 {
             fonts.set(f.tag.as_bytes().to_vec(), f.font.clone());
         }
@@ -427,6 +427,10 @@ impl<'a> Writer<'a> {
 
 /// `/Font` resources naming `/Helv`: standard Helvetica with WinAnsiEncoding.
 fn helvetica_resource() -> Object {
+    Object::Dict(helvetica_fonts())
+}
+
+fn helvetica_fonts() -> Dict {
     let mut font = Dict::new();
     font.set(b"Type".to_vec(), Object::name("Font"));
     font.set(b"Subtype".to_vec(), Object::name("Type1"));
@@ -434,7 +438,7 @@ fn helvetica_resource() -> Object {
     font.set(b"Encoding".to_vec(), Object::name("WinAnsiEncoding"));
     let mut fonts = Dict::new();
     fonts.set(b"Helv".to_vec(), Object::Dict(font));
-    Object::Dict(fonts)
+    fonts
 }
 
 /// Where a caret and its paragraph symbol go within `rect`: the box the caret is drawn in, and for
