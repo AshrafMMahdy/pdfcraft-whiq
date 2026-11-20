@@ -152,7 +152,8 @@ pub fn flatten_fill_sign(doc: &mut Document, pages: &[usize]) -> Result<usize, E
 /// The first annotation flattening would turn into page content with `?` in it, before anything
 /// changes: one whose appearance PdfCraft drew with `?` for characters its fonts can't draw
 /// (`pdfcraft_fonts::UNDRAWN_MARK`: a form field's value, a comment's text), or a comment without
-/// an appearance whose text the standard fonts can't draw. Its page (0-based), whether it is a
+/// an appearance whose text neither the standard fonts nor the Inter face can draw (WHIQ: Greek,
+/// Cyrillic and the like are drawn in the face). Its page (0-based), whether it is a
 /// form field, and the character.
 fn undrawn_on(doc: &Document, all: &[pdfcraft_model::Page], pages: &[usize], which: Which) -> Option<(usize, bool, char)> {
     for &i in pages {
@@ -165,7 +166,7 @@ fn undrawn_on(doc: &Document, all: &[pdfcraft_model::Page], pages: &[usize], whi
             }
             let widget = d.name(b"Subtype") == Some(b"Widget");
             let drawn = pdfcraft_fonts::undrawn_mark(&d);
-            let would_draw = || (!widget && appearance(doc, &d).is_none()).then(|| pdfcraft_annot::appearance::undrawable_text(&d)).flatten();
+            let would_draw = || (!widget && appearance(doc, &d).is_none()).then(|| pdfcraft_annot::appearance::undrawn_text(&d, true)).flatten();
             if let Some(c) = drawn.or_else(|| would_draw().map(|(_, c)| c)) {
                 return Some((i, widget, c));
             }
@@ -233,7 +234,7 @@ fn flatten_in(doc: &mut Document, pages: &[usize], which: Which) -> Result<usize
                 continue;
             }
             // A subtype this build cannot draw fails here and is kept below, so the comment is
-            // not deleted with nothing drawn in its place. (Text the standard fonts can't draw
+            // not deleted with nothing drawn in its place. (Text no font of ours can draw
             // was refused before anything changed: `undrawn_on`.)
             let _ = pdfcraft_annot::set_appearance(doc, r);
         }

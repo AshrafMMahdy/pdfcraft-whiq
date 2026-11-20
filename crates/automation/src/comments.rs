@@ -538,7 +538,7 @@ impl Automation {
             return self.apply(a, edit);
         }
         let text_at = |t: &str| {
-            let w = (pdfcraft_engine::annot_text::text_width(t, size) + 8.0).clamp(20.0, 600.0);
+            let w = (pdfcraft_engine::annot_text::text_width_for(t, t, size) + 8.0).clamp(20.0, 600.0);
             let h = size * 1.2 + 6.0;
             let rect = pdfcraft_engine::text_box_at(i64::from(info.rotation), at, w, h).unwrap_or([at[0], at[1] - h, at[0] + w, at[1]]);
             Shape::Typewriter { rect, font_size: size }

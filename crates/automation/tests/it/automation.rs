@@ -6032,12 +6032,32 @@ fn text_the_standard_fonts_cannot_draw_is_never_silent_through_tools() {
     warned(&out, &["U+7B7E"]);
     // WHIQ: text the standard fonts lack and the bundled Inter face has (Greek, Cyrillic, Turkish, Vietnamese) is drawn in that
     // face, embedded once: nothing came out as `?`, so there is nothing to say (it was kept and warned about, drawn as `?`).
-    for words in ["Αλλαγή πάχους τοιχίου", "Изменение толщины стены", "Değişiklik ığşİĞŞ", "Thay đổi độ dày tường"] {
+    for words in ["Αλλαγή πάχους τοιχίου", "Изменение толщины стены", "Değişiklik ığşİĞŞ", "Thay đổi độ dày tường"]
+    {
         let out = ok(&mut a, "comment_add", json!({ "doc": doc, "page": 1, "type": "textbox", "rect": [10, 250, 190, 290], "contents": words }));
         assert!(out.get("warnings").is_none(), "{words}: {out}");
-        let out = ok(&mut a, "comment_add", json!({ "doc": doc, "page": 1, "type": "callout", "rect": [60, 440, 190, 480], "to": [20, 500], "contents": words }));
+        let out = ok(
+            &mut a,
+            "comment_add",
+            json!({ "doc": doc, "page": 1, "type": "callout", "rect": [60, 440, 190, 480], "to": [20, 500], "contents": words }),
+        );
         assert!(out.get("warnings").is_none(), "{words} in a callout: {out}");
     }
+    // Fill & Sign text in such letters: its box is as wide as the text in the face it is written in (it was sized with
+    // Helvetica's widths, and the last words were cut off), a tab beside Greek is a space, and nothing is said.
+    let wide = "ШШШШШШШШШШ ЖЖЖЖЖЖЖЖЖЖ ЮЮЮЮЮЮЮЮЮЮ";
+    let out = ok(&mut a, "fill_sign_add", json!({ "doc": doc, "page": 1, "type": "text", "at": [20, 520], "text": wide }));
+    assert!(out.get("warnings").is_none(), "{out}");
+    let list = ok(&mut a, "comment_list", json!({ "doc": doc }));
+    let placed = list["comments"].as_array().unwrap().iter().find(|c| c["contents"] == wide).unwrap_or_else(|| panic!("{list}")).clone();
+    let r: Vec<f64> = placed["rect"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
+    // 30 wide capitals at 10 pt: no narrower than 7 pt each in any upright sans (Helvetica's `?` is 5.56 pt).
+    assert!(r[2] - r[0] >= 30.0 * 7.0, "the box holds its text: {r:?}");
+    let out = ok(&mut a, "comment_add", json!({ "doc": doc, "page": 1, "type": "textbox", "rect": [10, 560, 190, 600], "contents": "Αλφα\tΒήτα" }));
+    assert!(out.get("warnings").is_none(), "{out}");
+    // An accent with no letter of its own beside Greek is `?`, and said.
+    let out = ok(&mut a, "comment_add", json!({ "doc": doc, "page": 1, "type": "textbox", "rect": [10, 610, 190, 650], "contents": "Γ\u{301}άλα" }));
+    warned(&out, &["a comment on page 1", "(U+0301)", "Latin, Greek and Cyrillic"]);
     // A sticky note draws an icon, not its text: nothing to say.
     let out = ok(&mut a, "comment_add", json!({ "doc": doc, "page": 1, "type": "note", "at": [40, 40], "contents": "签名 OK", "author": "Ada" }));
     assert!(out.get("warnings").is_none(), "{out}");

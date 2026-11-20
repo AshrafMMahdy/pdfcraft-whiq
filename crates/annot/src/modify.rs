@@ -15,7 +15,7 @@ use super::{AnnotError, Dict, Document, HashMap, HashSet, ObjRef, Object, PdfStr
 pub(crate) fn refuse_foreign_text(doc: &Document, d: &Dict) -> Result<(), AnnotError> {
     let drawn_elsewhere =
         d.get(b"AP").is_some_and(|ap| doc.resolve(ap).as_dict().is_some_and(|ap| ap.contains(b"N"))) && pdfcraft_fonts::undrawn_mark(d).is_none();
-    if drawn_elsewhere && let Some((what, c)) = appearance::undrawn_text(d) {
+    if drawn_elsewhere && let Some((what, c)) = appearance::undrawn_text(d, true) {
         return Err(AnnotError::Undrawable(format!(
             "PdfCraft can't redraw this comment: its fonts can't draw \"{}\" (U+{:04X}) in {what}, which would then show as ? (the comment was left as it is)",
             c.escape_debug(),

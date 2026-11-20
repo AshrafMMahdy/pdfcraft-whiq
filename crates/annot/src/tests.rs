@@ -1492,6 +1492,95 @@ fn comment_text_beyond_western_european_is_drawn_in_the_embedded_face() {
     assert_eq!(mark(&doc, made[1]), None);
 }
 
+/// WHIQ: in the embedded face a tab is a space and a soft hyphen a hyphen (as the standard fonts
+/// draw them), a letter typed with its accents apart is drawn as the one letter, and an accent that
+/// has no such letter is `?` and marked. They came out as `?`, or as loose accents, without a word.
+#[test]
+fn text_in_the_embedded_face_keeps_tabs_hyphens_and_composes_accents() {
+    use unicode_normalization::UnicodeNormalization as _;
+    let mut doc = fixture();
+    let ap = |doc: &Document, d: &Dict| -> (Vec<u8>, Option<Object>) {
+        let n = d.get(b"AP").map(|a| doc.resolve(a)).and_then(|a| a.as_dict().and_then(|a| a.reference(b"N"))).expect("has /AP /N");
+        let Object::Stream(s) = &*doc.get(n) else { panic!("AP is not a stream") };
+        let face =
+            doc.dict(s.dict.get(b"Resources").expect("resources")).and_then(|r| doc.dict(r.get(b"Font")?)).and_then(|f| f.get(b"PCFull0").cloned());
+        (s.decoded().unwrap(), face)
+    };
+    let shows = |doc: &Document, d: &Dict, text: &str| -> bool {
+        let (bytes, Some(font)) = ap(doc, d) else { return false };
+        let metrics = pdfcraft_fonts::pdf::Metrics::from_dict(doc, &doc.dict(&font).unwrap());
+        let want = pdfcraft_fonts::literal(&metrics.encode(text).expect("the face has every character"));
+        bytes.windows(want.len()).any(|w| w == want.as_slice())
+    };
+    let boxed = |doc: &mut Document, text: &str, k: usize| {
+        let top = 700.0 - 60.0 * k as f64;
+        let mut b = new(0, Shape::TextBox { rect: [100.0, top - 50.0, 420.0, top], font_size: 12.0 });
+        b.contents = text.into();
+        add_annotation(doc, &b, &meta(&format!("t{k}"))).unwrap()
+    };
+    let mark = |doc: &Document, i: usize| pdfcraft_fonts::undrawn_mark(&list(doc, 0)[i]);
+    let tab = boxed(&mut doc, "Αλφα\tΒήτα", 0);
+    assert!(shows(&doc, &list(&doc, 0)[tab], "Αλφα Βήτα"), "a tab is a space");
+    assert_eq!(mark(&doc, tab), None);
+    let soft = boxed(&mut doc, "Αλφα\u{ad}Βήτα", 1);
+    assert!(shows(&doc, &list(&doc, 0)[soft], "Αλφα-Βήτα"), "a soft hyphen is a hyphen");
+    assert_eq!(mark(&doc, soft), None);
+    let apart: String = "Thay đổi độ dày, Ελληνικά".nfd().collect();
+    assert_ne!(apart, "Thay đổi độ dày, Ελληνικά", "the test's text has its accents apart");
+    let nfd = boxed(&mut doc, &apart, 2);
+    assert!(shows(&doc, &list(&doc, 0)[nfd], "Thay đổi độ dày, Ελληνικά"), "each letter with its accents is the one letter");
+    assert_eq!(mark(&doc, nfd), None);
+    // Γ with an acute has no letter of its own: the accent is ? and the comment is marked.
+    let loose = boxed(&mut doc, "Γ\u{301}άλα", 3);
+    assert!(shows(&doc, &list(&doc, 0)[loose], "Γ?άλα"));
+    assert_eq!(mark(&doc, loose), Some('\u{301}'));
+    // Western European text typed with its accents apart needs no face: Helvetica writes the letter.
+    let west = boxed(&mut doc, "e\u{301}cole", 4);
+    let (bytes, face) = ap(&doc, &list(&doc, 0)[west]);
+    assert!(face.is_none() && bytes.windows(7).any(|w| w == b"(\xE9cole)"), "{}", String::from_utf8_lossy(&bytes));
+    assert_eq!(mark(&doc, west), None);
+    // The box is sized with the face's widths, not Helvetica's.
+    let wide = "ШШШШШШШШШШ ЖЖЖЖЖЖЖЖЖЖ ЮЮЮЮЮЮЮЮЮЮ";
+    assert!((appearance::text_width_for(wide, wide, 10.0) - pdfcraft_fonts::inter_width(wide, 10.0)).abs() < 1e-9);
+    assert!(
+        appearance::text_width_for(wide, wide, 10.0) > appearance::text_width(wide, 10.0) * 1.5,
+        "Helvetica has none of these letters: its width is of ?"
+    );
+}
+
+/// WHIQ: a text box another program left without an appearance, in Greek, is shown in the Inter
+/// face in the display copy (it was shown as `?`); the document itself is not changed.
+#[test]
+fn a_display_copy_draws_text_beyond_western_european_in_the_face() {
+    let mut doc = fixture();
+    let mut foreign = Dict::new();
+    foreign.set(b"Type".to_vec(), Object::name("Annot"));
+    foreign.set(b"Subtype".to_vec(), Object::name("FreeText"));
+    foreign.set(b"Rect".to_vec(), Object::Array([100.0, 300.0, 300.0, 330.0].iter().map(|v| Object::Real(*v)).collect()));
+    foreign.set(b"DA".to_vec(), PdfString::literal(b"0 g /Helv 12 Tf".to_vec()));
+    foreign.set(b"Contents".to_vec(), PdfString::text("Καλημέρα κόσμε"));
+    let r = doc.add(Object::Dict(foreign));
+    let page = page_ref(&doc, 0).unwrap();
+    let mut on_page = annots(&doc, page);
+    on_page.push(Object::Ref(r));
+    set_annots(&mut doc, page, on_page).unwrap();
+    let copy = with_missing_appearances(&doc).expect("a copy with the appearance");
+    let d = annot_dict(&copy, r);
+    let n = d.get(b"AP").map(|a| copy.resolve(a)).and_then(|a| a.as_dict().and_then(|a| a.reference(b"N"))).expect("has /AP /N");
+    let Object::Stream(s) = &*copy.get(n) else { panic!("AP is not a stream") };
+    let font = copy
+        .dict(s.dict.get(b"Resources").unwrap())
+        .and_then(|r| copy.dict(r.get(b"Font")?))
+        .and_then(|f| f.get(b"PCFull0").cloned())
+        .expect("the face");
+    let metrics = pdfcraft_fonts::pdf::Metrics::from_dict(&copy, &copy.dict(&font).unwrap());
+    let want = pdfcraft_fonts::literal(&metrics.encode("Καλημέρα κόσμε").unwrap());
+    assert!(s.decoded().unwrap().windows(want.len()).any(|w| w == want.as_slice()));
+    assert_eq!(pdfcraft_fonts::undrawn_mark(&d), None);
+    assert!(!annot_dict(&doc, r).contains(b"AP"), "the document keeps the comment as it was");
+    assert!(!doc.dict(&Object::Ref(doc.root().unwrap())).unwrap().contains(b"PCAnnotFont"), "and no font");
+}
+
 /// Comment text the standard fonts can't draw is kept, as Acrobat keeps it: a text box, Fill & Sign
 /// text or a dynamic stamp's by-line is added with its text as typed, its appearance draws `?` for
 /// those characters, and the comment is marked with the first one (cleared once all of it can be

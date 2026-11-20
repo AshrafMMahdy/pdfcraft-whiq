@@ -198,14 +198,26 @@ out as `?`, kept and marked (`PCUndrawn`). An agent marking up a drawing in Gree
 callouts (the platform's own, removed `markup_pdf` drew them).
 
 - Text with a character the standard fonts can't draw and the bundled Inter face can is written in Inter instead: a text box, a
-  callout, Fill & Sign text, a line's caption, a measurement label, a dynamic stamp's "By" line (`appearance::build_with`,
-  `UnicodeFace`, `needs_face`). The whole text of that comment is in Inter, measured and wrapped with Inter's advances.
-- The face is embedded ONCE per document (`draw::unicode_face`): the catalog's private entry `/PCAnnotFont` names the Type 0 font,
-  and every later comment offers it to `embedding::embed`, which reuses the same embedding (program, maps, widths).
-- Western European text is written exactly as before (Helvetica, byte for byte). A character neither font has (CJK, Arabic, …)
-  still comes out as `?` and the comment is marked, as before; a comment another program drew is refused a redraw only for such a
-  character (it was refused for any character outside WinAnsi).
-- Not changed: a redaction's overlay text (drawn in the standard fonts when applied: still refused), and the display copy of a
-  comment that has no appearance (drawn in the standard fonts, nothing is embedded in a copy that is never saved).
-- Tests: `annot` `comment_text_beyond_western_european_is_drawn_in_the_embedded_face`; `automation`
-  `text_the_standard_fonts_cannot_draw_is_never_silent_through_tools` (no warning for such text in a text box and a callout).
+  callout, Fill & Sign text and dates, a line's caption, a measurement label, a dynamic stamp's "By" line
+  (`appearance::build_with`, `UnicodeFace`, `needs_face`). The whole text of that comment is in Inter, measured and wrapped with
+  Inter's advances — also where its box is sized (`text_width_for`, `wrap_for`: `annot::modify`, `fill_sign_add`, the desktop
+  app's text-box geometry).
+- What the face writes (`face_text`): a letter typed with its accents apart is the one letter (NFC, in Helvetica too); a tab is a
+  space and a soft hyphen a hyphen, as the standard fonts draw them; a character the face lacks, and an accent that has no letter
+  of its own (no shaping), is `?` and the comment is marked and warned about, as before (`undrawn_text`, `first_undrawn`: one
+  rule for the mark, the warning, the refusals and a Fill & Sign date).
+- The face is embedded once per document (`draw::unicode_face`): the catalog's private entry `/PCAnnotFont` names the Type 0 font,
+  and every later comment offers it to `embedding::embed`, which reuses the same embedding (program, maps, widths). A document
+  made by `combine` does not carry that entry: its next such comment writes the font's dictionaries once more (about 50 KB); the
+  font program stays single.
+- A comment another program left without an appearance: its display copy shows such text in the face (embedded in the copy, which
+  is never saved), and flattening draws it (both gave `?` / a refusal). A comment another program drew is refused a redraw only
+  for a character neither font has.
+- Western European text is written exactly as before (Helvetica). The warning and the tool descriptions (`annotate`,
+  `fill_sign_add`, a date format) say Latin, Greek and Cyrillic letters.
+- Not changed: a redaction's overlay text (drawn in the standard fonts when applied: still refused); the desktop app's own
+  notice under Preferences ▸ Date format (its sentence is in 30 translation files).
+- Tests: `annot` `comment_text_beyond_western_european_is_drawn_in_the_embedded_face`,
+  `text_in_the_embedded_face_keeps_tabs_hyphens_and_composes_accents`, `a_display_copy_draws_text_beyond_western_european_in_the_face`;
+  `edit` `flattening_draws_a_greek_comment_that_has_no_appearance`; `engine` `dates`; `automation`
+  `text_the_standard_fonts_cannot_draw_is_never_silent_through_tools`.

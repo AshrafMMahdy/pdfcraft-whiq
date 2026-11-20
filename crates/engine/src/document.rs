@@ -137,7 +137,7 @@ impl std::fmt::Display for TextNotice {
             ),
             (None, _) => write!(
                 f,
-                "a comment on page {page} has {ch}, which the standard fonts can't draw: its text is saved, but its appearance shows ? in its place in every viewer"
+                "a comment on page {page} has {ch}, which its fonts can't draw (they have Latin, Greek and Cyrillic letters): its text is saved, but its appearance shows ? in its place in every viewer"
             ),
         }
     }

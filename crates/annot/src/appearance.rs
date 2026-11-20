@@ -351,33 +351,66 @@ pub fn inter_draws(c: char) -> bool {
     pdfcraft_fonts::embedding::covers(pdfcraft_fonts::INTER_REGULAR, c.encode_utf8(&mut [0; 4]))
 }
 
+/// `text` with each letter and its combining marks as the one letter Unicode has for them (NFC):
+/// a font draws "é" typed as "e" and an accent as one glyph only so.
+fn composed(text: &str) -> String {
+    use unicode_normalization::UnicodeNormalization as _;
+    text.nfc().collect()
+}
+
+/// What the Inter face writes for `c`: `c` when the face has it; a space for a tab and a hyphen for
+/// a soft hyphen, as the standard fonts draw them. `None` (written `?`) for anything else, and for
+/// a combining mark left after [`composed`]: without shaping it has no place on its letter.
+fn face_char(c: char) -> Option<char> {
+    match c {
+        '\t' => Some(' '),
+        '\u{ad}' => Some('-'),
+        c if unicode_normalization::char::is_combining_mark(c) => None,
+        c if inter_draws(c) => Some(c),
+        _ => None,
+    }
+}
+
+/// `text` as the Inter face writes it ([`composed`], [`face_char`]); line breaks are kept.
+fn face_text(text: &str) -> String {
+    composed(text).chars().map(|c| if matches!(c, '\n' | '\r') { c } else { face_char(c).unwrap_or('?') }).collect()
+}
+
 /// Whether `text` is written in the embedded Inter face: it has a character the standard fonts
 /// can't draw and Inter can. One rule for the drawing, the embedding and the sizing of a text box.
 pub fn needs_face(text: &str) -> bool {
-    text.chars().any(|c| !matches!(c, '\n' | '\r') && first_undrawable(c.encode_utf8(&mut [0; 4])).is_some() && inter_draws(c))
+    composed(text).chars().any(|c| !matches!(c, '\n' | '\r') && !pdfcraft_fonts::win_ansi_encodable(c) && face_char(c).is_some())
 }
 
-/// The first character of `d`'s drawn text that comes out as `?` although the Inter face is used
-/// for what the standard fonts can't draw: neither has it. A redaction's overlay text is drawn in
-/// the standard fonts when it is applied, so there it is [`undrawable_text`].
-pub fn undrawn_text(d: &Dict) -> Option<(&'static str, char)> {
+/// The first character of `d`'s drawn text that comes out as `?`. `face`: whether the Inter face is
+/// there for text that calls for it ([`needs_face`]); such a text is written in it whole, so what
+/// counts is what the face lacks ([`face_char`]), and for any other text what the standard fonts
+/// lack. A redaction's overlay text is drawn in the standard fonts when it is applied, as typed, so
+/// there it is [`undrawable_text`].
+pub fn undrawn_text(d: &Dict, face: bool) -> Option<(&'static str, char)> {
     if d.name(b"Subtype") == Some(b"Redact") {
         return undrawable_text(d);
     }
     let (what, text) = drawn_text(d)?;
-    let c = text.chars().find(|c| !matches!(c, '\n' | '\r') && first_undrawable(c.encode_utf8(&mut [0; 4])).is_some() && !inter_draws(*c))?;
-    Some((what, c))
+    Some((what, first_undrawn(&text, face)?))
+}
+
+/// The first character of a comment's `text` that comes out as `?` ([`undrawn_text`]).
+pub fn first_undrawn(text: &str, face: bool) -> Option<char> {
+    let text = composed(text);
+    let in_face = face && needs_face(&text);
+    text.chars().find(|&c| !matches!(c, '\n' | '\r') && if in_face { face_char(c).is_none() } else { !pdfcraft_fonts::win_ansi_encodable(c) })
 }
 
 /// Advance of `line` in the font the whole `text` it belongs to is written in ([`needs_face`]):
-/// Inter or Helvetica.
+/// what a text box is sized with, so the box and its appearance agree.
 pub fn text_width_for(text: &str, line: &str, size: f64) -> f64 {
-    if needs_face(text) { inter_width(line, size) } else { text_width(line, size) }
+    if needs_face(text) { inter_width(&face_text(line), size) } else { text_width(&composed(line), size) }
 }
 
 /// [`wrap`] in the font `text` is written in ([`needs_face`]).
 pub fn wrap_for(text: &str, size: f64, width: f64) -> Vec<String> {
-    if needs_face(text) { wrap_with(text, size, width, inter_width) } else { wrap(text, size, width) }
+    if needs_face(text) { wrap_with(&face_text(text), size, width, inter_width) } else { wrap(&composed(text), size, width) }
 }
 
 /// How one text of an appearance is written: in Helvetica, or in the embedded face when the text
@@ -397,22 +430,20 @@ impl<'a> Writer<'a> {
 
     /// `text` as the string operand of `Tj`. A character the font has no glyph for is `?`.
     fn show(&self, text: &str) -> Vec<u8> {
-        if let Some(f) = self.0 {
-            let drawn: String = text.chars().map(|c| if inter_draws(c) { c } else { '?' }).collect();
-            if let Some(bytes) = f.metrics.encode(&drawn) {
-                return literal(&bytes);
-            }
+        match self.0 {
+            // (Every character of `face_text` is one the face has, so there is always an encoding.)
+            Some(f) => literal(&f.metrics.encode(&face_text(text)).unwrap_or_default()),
+            // WinAnsi bytes go into the stream as-is, not through UTF-8.
+            None => literal(&win_ansi(&composed(text))),
         }
-        // WinAnsi bytes go into the stream as-is, not through UTF-8.
-        literal(&win_ansi(text))
     }
 
     fn width(&self, text: &str, size: f64) -> f64 {
-        if self.0.is_some() { inter_width(text, size) } else { text_width(text, size) }
+        if self.0.is_some() { inter_width(&face_text(text), size) } else { text_width(&composed(text), size) }
     }
 
     fn wrap(&self, text: &str, size: f64, width: f64) -> Vec<String> {
-        if self.0.is_some() { wrap_with(text, size, width, inter_width) } else { wrap(text, size, width) }
+        if self.0.is_some() { wrap_with(&face_text(text), size, width, inter_width) } else { wrap(&composed(text), size, width) }
     }
 
     /// The `/Font` resources for what this writer wrote: Helvetica, and the face when it is used.

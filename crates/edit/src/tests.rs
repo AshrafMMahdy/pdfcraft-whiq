@@ -796,6 +796,38 @@ fn flattening_refuses_what_would_bake_in_question_marks() {
     assert_eq!(flatten(&mut doc, &[0], true, false).unwrap(), 1);
 }
 
+/// WHIQ: a text box another program left without an appearance, in Greek, flattens: its text is
+/// drawn in the embedded Inter face (it was refused as text "its font can't draw", although a
+/// restyle of the same comment drew it).
+#[test]
+fn flattening_draws_a_greek_comment_that_has_no_appearance() {
+    let page = stream("", " ");
+    // "Καλημέρα" as a UTF-16BE text string.
+    let greek: String = "Καλημέρα".encode_utf16().map(|u| format!("{u:04X}")).collect();
+    let mut doc = build(&[
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << >> /Contents 4 0 R /Annots [5 0 R] >>",
+        &page,
+        &format!("<< /Type /Annot /Subtype /FreeText /Rect [10 10 150 40] /DA (0 g /Helv 12 Tf) /Contents <FEFF{greek}> /F 4 >>"),
+    ]);
+    assert_eq!(flatten(&mut doc, &[0], true, false).unwrap(), 1);
+    let left = pdfcraft_model::pages(&doc)[0].dict.get(b"Annots").map(|a| doc.resolve(a)).and_then(|a| a.as_array().map(Vec::len)).unwrap_or(0);
+    assert_eq!(left, 0, "the comment is page content now");
+    // The page draws a form that names the embedded face and writes no `?` in it.
+    let forms: Vec<_> = doc
+        .scan_objects()
+        .filter_map(|(_, o)| match &*o {
+            Object::Stream(s) if s.dict.name(b"Subtype") == Some(b"Form") => {
+                Some(String::from_utf8_lossy(&s.decoded().unwrap_or_default()).into_owned())
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(forms.iter().any(|f| f.contains("/PCFull0 12 Tf")), "drawn in the embedded face: {forms:?}");
+    assert!(forms.iter().all(|f| !f.contains("(????")), "nothing came out as ?: {forms:?}");
+}
+
 /// Display space is in points, so on a `/UserUnit 2` page an item's box maps to half as many
 /// user-space units. Items record the `/UserUnit` they were written for; one without it was
 /// written when display space was in user-space units, and reads back scaled to points.

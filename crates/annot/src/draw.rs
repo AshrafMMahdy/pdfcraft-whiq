@@ -37,7 +37,7 @@ pub(crate) fn draw_appearance(doc: &mut Document, r: ObjRef) -> Result<(), Annot
     let face = unicode_face(doc, &d);
     let Some(stream) = build_appearance(doc, &d, face.as_ref()) else { return Err(AnnotError::Unsupported(subtype)) };
     // What still came out as `?`: with the face, what neither font has; without it (it could not be embedded), what the standard fonts lack.
-    let missing = if face.is_some() { appearance::undrawn_text(&d) } else { appearance::undrawable_text(&d) }.map(|(_, c)| c);
+    let missing = appearance::undrawn_text(&d, face.is_some()).map(|(_, c)| c);
     apply_appearance(doc, r, &d, stream, missing)
 }
 
@@ -212,9 +212,20 @@ pub fn with_missing_appearances_cached(doc: &Document, cache: &mut AppearanceCac
             if has_normal {
                 continue;
             }
+            // Text the standard fonts can't draw is shown in the Inter face, embedded in the copy (WHIQ: a
+            // comment another program left without an appearance was shown as `?`). Its drawing names
+            // a font of this copy, so it is made for each copy, not kept.
+            if appearance::drawn_text(&d).is_some_and(|(_, text)| appearance::needs_face(&text)) && d.name(b"Subtype") != Some(b"Redact") {
+                let copy = copy.get_or_insert_with(|| doc.clone());
+                let face = unicode_face(copy, &d);
+                if let Some(stream) = build_appearance(copy, &d, face.as_ref()) {
+                    apply_appearance(copy, r, &d, stream, appearance::undrawn_text(&d, face.is_some()).map(|(_, c)| c)).ok();
+                }
+                continue;
+            }
             if let Some(stream) = cache.get(r) {
                 // Fails only when `r` isn't a dictionary, which the cached build ruled out.
-                apply_appearance(copy.get_or_insert_with(|| doc.clone()), r, &d, stream, appearance::undrawable_text(&d).map(|(_, c)| c)).ok();
+                apply_appearance(copy.get_or_insert_with(|| doc.clone()), r, &d, stream, appearance::undrawn_text(&d, false).map(|(_, c)| c)).ok();
                 continue;
             }
             // Another program's stamp gets a drawing for display only (ISO 32000-2 Table 184). Its
@@ -224,11 +235,10 @@ pub fn with_missing_appearances_cached(doc: &Document, cache: &mut AppearanceCac
                 bare.remove(b"AP");
                 appearance::display_stamp(&bare)
             };
-            // (A display copy draws in the standard fonts only: nothing is embedded in a copy that is never saved.)
             let Some(stream) = build_appearance(doc, &d, None).or_else(other_stamp) else { continue };
             cache.insert(r, &stream);
             // Fails only when `r` isn't a dictionary, which the build just ruled out.
-            apply_appearance(copy.get_or_insert_with(|| doc.clone()), r, &d, stream, appearance::undrawable_text(&d).map(|(_, c)| c)).ok();
+            apply_appearance(copy.get_or_insert_with(|| doc.clone()), r, &d, stream, appearance::undrawn_text(&d, false).map(|(_, c)| c)).ok();
         }
     }
     copy

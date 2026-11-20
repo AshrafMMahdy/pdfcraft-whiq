@@ -582,16 +582,16 @@ pub fn date_language(code: &str) -> Option<&'static DateLanguage> {
     DATE_LANGUAGES.iter().find(|l| l.code.eq_ignore_ascii_case(code.trim()))
 }
 
-/// The characters of `text` that Fill & Sign can't write into a PDF yet, each once. Its text is
-/// drawn in Helvetica with WinAnsi encoding (Western European letters), so anything else (`ř`,
-/// Japanese, Chinese) would become `?` in the file.
+/// The characters of `text` that Fill & Sign can't write into a PDF yet, each once. Its text is a
+/// comment's: drawn in Helvetica (Western European letters), or in the embedded Inter face when it
+/// has a letter beyond those (WHIQ: `ř`, Greek, Cyrillic); anything neither has (Japanese, Chinese)
+/// would become `?` in the file.
 pub fn unwritable(text: &str) -> String {
     let mut out = String::new();
-    for c in text.chars() {
-        let mut buf = [0u8; 4];
-        if c != '?' && pdfcraft_fonts::win_ansi(c.encode_utf8(&mut buf)) == b"?" && !out.contains(c) {
-            out.push(c);
-        }
+    let mut rest = text.to_string();
+    while let Some(c) = pdfcraft_annot::appearance::first_undrawn(&rest, true) {
+        out.push(c);
+        rest = rest.replace(c, "");
     }
     out
 }
@@ -751,7 +751,7 @@ impl Session {
         match unwritable(&text) {
             bad if bad.is_empty() => Ok(text),
             bad => Err(format!(
-                "\"{text}\" can't be written into the PDF yet: Fill & Sign text is Western European only ({bad}); pick a numeric format such as dd.mm.yyyy"
+                "\"{text}\" can't be written into the PDF yet: Fill & Sign text is in Latin, Greek and Cyrillic letters only ({bad}); pick a numeric format such as dd.mm.yyyy"
             )),
         }
     }
@@ -975,10 +975,9 @@ mod tests {
         assert_eq!(s.today_text(None, None).as_deref(), Ok("noiembrie 2023"));
         s.set_date_format("ddd, d mmm").unwrap();
         assert_eq!(s.today_text(None, None).as_deref(), Ok("mar., 14 nov."));
-        // `14 noiembrie 2023` is WinAnsi; the weekday `marți` (ț, comma below) is not, so Fill & Sign refuses that format.
+        // `14 noiembrie 2023` is WinAnsi; the weekday `marți` (ț, comma below) is not: WHIQ writes it in the Inter face (it was refused).
         assert_eq!(s.today_text_for_pdf(Some("d mmmm yyyy"), Some("ro")).as_deref(), Ok("14 noiembrie 2023"));
-        let e = s.today_text_for_pdf(Some("dddd d mmmm yyyy"), Some("ro")).unwrap_err();
-        assert!(e.contains("can't be written into the PDF yet"), "{e}");
+        assert_eq!(s.today_text_for_pdf(Some("dddd d mmmm yyyy"), Some("ro")).as_deref(), Ok("marți 14 noiembrie 2023"));
     }
 
     #[test]
@@ -992,17 +991,17 @@ mod tests {
         assert_eq!(s.today_text(None, None).as_deref(), Ok("Tháng 11 2023"));
         s.set_date_format("ddd, d mmm").unwrap();
         assert_eq!(s.today_text(None, None).as_deref(), Ok("T3, 14 Thg 11"));
-        // Encoding follows the spelled text: `14 tháng 11 2023` is WinAnsi-representable;
-        // a weekday name such as `Thứ Ba` is not, so Fill & Sign refuses that format.
+        // `14 tháng 11 2023` is WinAnsi-representable; a weekday name such as `Thứ Ba` is not:
+        // WHIQ writes it in the Inter face (it was refused).
         assert_eq!(s.today_text_for_pdf(Some("d mmmm yyyy"), Some("vi")).as_deref(), Ok("14 tháng 11 2023"));
-        let e = s.today_text_for_pdf(Some("dddd d mmmm yyyy"), Some("vi")).unwrap_err();
-        assert!(e.contains("can't be written into the PDF yet") && e.contains("dd.mm.yyyy"), "{e}");
+        assert_eq!(s.today_text_for_pdf(Some("dddd d mmmm yyyy"), Some("vi")).as_deref(), Ok("Thứ Ba 14 tháng 11 2023"));
         assert!(s.today_text_for_pdf(Some("dd.mm.yyyy"), Some("vi")).is_ok());
     }
 
     #[test]
     fn dates_the_pdf_cannot_hold_are_refused_not_damaged() {
-        assert_eq!(unwritable("8. října 2026"), "ř");
+        assert_eq!(unwritable("8. října 2026"), "", "WHIQ: written in the Inter face");
+        assert_eq!(unwritable("8 октября 2026, 8 Οκτωβρίου"), "");
         assert_eq!(unwritable("2026年10月8日"), "年月日");
         assert_eq!(unwritable("sábado, 7 de março – 2026?"), "", "Western European, dashes and ? are fine");
         assert_eq!(unwritable("lørdag 7. mars, søn. 8. mai (æøå ÆØÅ)"), "", "Norwegian letters are Western European");
