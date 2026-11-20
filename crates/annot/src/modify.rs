@@ -15,9 +15,9 @@ use super::{AnnotError, Dict, Document, HashMap, HashSet, ObjRef, Object, PdfStr
 pub(crate) fn refuse_foreign_text(doc: &Document, d: &Dict) -> Result<(), AnnotError> {
     let drawn_elsewhere =
         d.get(b"AP").is_some_and(|ap| doc.resolve(ap).as_dict().is_some_and(|ap| ap.contains(b"N"))) && pdfcraft_fonts::undrawn_mark(d).is_none();
-    if drawn_elsewhere && let Some((what, c)) = appearance::undrawable_text(d) {
+    if drawn_elsewhere && let Some((what, c)) = appearance::undrawn_text(d) {
         return Err(AnnotError::Undrawable(format!(
-            "PdfCraft can't redraw this comment: the standard fonts can't draw \"{}\" (U+{:04X}) in {what}, which would then show as ? (the comment was left as it is)",
+            "PdfCraft can't redraw this comment: its fonts can't draw \"{}\" (U+{:04X}) in {what}, which would then show as ? (the comment was left as it is)",
             c.escape_debug(),
             u32::from(c)
         )));
@@ -209,10 +209,10 @@ fn fitted_box(doc: &Document, r: ObjRef, text: &str) -> Option<[f64; 4]> {
         w
     } else {
         // No usable old width: fall back to the creation-time width (at most 300 pt).
-        let longest = text.lines().map(|l| appearance::text_width(l, size)).fold(0.0, f64::max);
+        let longest = text.lines().map(|l| appearance::text_width_for(text, l, size)).fold(0.0, f64::max);
         (longest + 2.0 * pad + 4.0).clamp(40.0, 300.0)
     };
-    let lines = appearance::wrap(text, size, (w - 2.0 * pad).max(1.0)).len().max(1) as f64;
+    let lines = appearance::wrap_for(text, size, (w - 2.0 * pad).max(1.0)).len().max(1) as f64;
     Some([x0, top - lines * size * 1.2 - 2.0 * pad - 2.0, x0 + w, top])
 }
 

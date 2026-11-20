@@ -7,10 +7,10 @@ use super::{AnnotError, Dict, Document, ObjRef, Object, Stream, appearance};
 /// (Re)generate `/AP /N` for the annotation `r` from its dictionary, for an edit that keeps its
 /// text (a restyle, a new size or colour).
 ///
-/// A comment whose text the standard fonts can't draw, with an appearance another program drew
-/// (with a font that has those characters), keeps that appearance: redrawing it would put `?` in
-/// their place, so the edit is refused (`AnnotError::Undrawable`). One PdfCraft drew with `?`
-/// (marked `pdfcraft_fonts::UNDRAWN_MARK`) is redrawn.
+/// A comment whose text neither the standard fonts nor the bundled Inter face can draw, with an
+/// appearance another program drew (with a font that has those characters), keeps that appearance:
+/// redrawing it would put `?` in their place, so the edit is refused (`AnnotError::Undrawable`).
+/// One PdfCraft drew with `?` (marked `pdfcraft_fonts::UNDRAWN_MARK`) is redrawn.
 pub fn set_appearance(doc: &mut Document, r: ObjRef) -> Result<(), AnnotError> {
     refuse_foreign_text(doc, &annot_dict(doc, r))?;
     draw_appearance(doc, r)
@@ -25,22 +25,59 @@ pub(crate) fn redraw_or_restore(doc: &mut Document, r: ObjRef, before: Dict) -> 
     Ok(())
 }
 
-/// Draw `r`'s normal appearance from its dictionary, whatever its text: characters the standard
-/// fonts can't draw come out as `?`, and the annotation is marked (`pdfcraft_fonts::UNDRAWN_MARK`,
+/// Draw `r`'s normal appearance from its dictionary, whatever its text: text the standard fonts
+/// can't draw is written in the bundled Inter face, embedded in the document once (WHIQ: it came
+/// out as `?`); characters neither can draw come out as `?`, and the annotation is marked (`pdfcraft_fonts::UNDRAWN_MARK`,
 /// cleared when all of it can be drawn) so the edit is reported and flattening won't make that
 /// `?` permanent. For new text (a new comment, changed contents), as Acrobat keeps text its font
 /// can't show, and for display-only copies.
 pub(crate) fn draw_appearance(doc: &mut Document, r: ObjRef) -> Result<(), AnnotError> {
     let d = annot_dict(doc, r);
     let subtype = String::from_utf8_lossy(d.name(b"Subtype").unwrap_or_default()).into_owned();
-    let Some(stream) = build_appearance(doc, &d) else { return Err(AnnotError::Unsupported(subtype)) };
-    apply_appearance(doc, r, &d, stream)
+    let face = unicode_face(doc, &d);
+    let Some(stream) = build_appearance(doc, &d, face.as_ref()) else { return Err(AnnotError::Unsupported(subtype)) };
+    // What still came out as `?`: with the face, what neither font has; without it (it could not be embedded), what the standard fonts lack.
+    let missing = if face.is_some() { appearance::undrawn_text(&d) } else { appearance::undrawable_text(&d) }.map(|(_, c)| c);
+    apply_appearance(doc, r, &d, stream, missing)
+}
+
+/// The catalog's private entry naming the Inter face embedded for comment text, so every comment of
+/// the document that needs it shares one font (its maps and widths are written once).
+const FACE_KEY: &[u8] = b"PCAnnotFont";
+
+/// The embedded Inter face for `d`'s text, when that text calls for it ([`appearance::needs_face`]):
+/// the one the document already has, else embedded now. `None` when the text needs none, for a
+/// redaction (its overlay text is drawn in the standard fonts when applied), or when the face
+/// could not be embedded (the text is then drawn as before, with `?`).
+fn unicode_face(doc: &mut Document, d: &Dict) -> Option<appearance::UnicodeFace> {
+    if d.name(b"Subtype") == Some(b"Redact") {
+        return None;
+    }
+    let (_, text) = appearance::drawn_text(d)?;
+    if !appearance::needs_face(&text) {
+        return None;
+    }
+    let root = doc.root()?;
+    let known = doc.dict(&Object::Ref(root))?.get(FACE_KEY).filter(|o| matches!(o, Object::Ref(_))).cloned();
+    // `embed` reuses a resource of this dictionary that is the same embedding (same program and
+    // maps), so the document's face is offered to it under the name it gives a first resource.
+    let mut fonts = Dict::new();
+    if let Some(font) = &known {
+        fonts.set(b"PCFull0".to_vec(), font.clone());
+    }
+    let tag = pdfcraft_fonts::embedding::embed(doc, &mut fonts, pdfcraft_fonts::INTER_REGULAR, "Inter").ok()?;
+    let font = fonts.get(tag.as_bytes())?.clone();
+    if known.as_ref() != Some(&font) {
+        doc.update_dict(root, |c| c.set(FACE_KEY.to_vec(), font.clone())).ok()?;
+    }
+    let metrics = pdfcraft_fonts::pdf::Metrics::from_dict(doc, &doc.dict(&font)?);
+    Some(appearance::UnicodeFace { tag, font, metrics })
 }
 
 /// Draw the appearance for an annotation dictionary: the expensive half of [`set_appearance`].
 /// Pure from the dictionary and the objects it points at, so [`AppearanceCache`] can reuse it.
-fn build_appearance(doc: &Document, d: &Dict) -> Option<Stream> {
-    let mut stream = appearance::build(d)?;
+fn build_appearance(doc: &Document, d: &Dict, face: Option<&appearance::UnicodeFace>) -> Option<Stream> {
+    let mut stream = appearance::build_with(d, face)?;
     // Picture-stamp restyling must retain the placement's page-axis correction.
     if d.get(b"PCPicture").is_some() {
         let matrix = d.get(b"AP").and_then(|ap| {
@@ -56,10 +93,9 @@ fn build_appearance(doc: &Document, d: &Dict) -> Option<Stream> {
     Some(stream)
 }
 
-/// Store a built appearance on the annotation: the cheap half of [`set_appearance`].
-fn apply_appearance(doc: &mut Document, r: ObjRef, d: &Dict, stream: Stream) -> Result<(), AnnotError> {
-    // Characters the standard fonts can't draw came out as `?`: mark the annotation with the first.
-    let missing = appearance::undrawable_text(d).map(|(_, c)| c);
+/// Store a built appearance on the annotation: the cheap half of [`set_appearance`]. `missing`: the
+/// first character that came out as `?` in it, which the annotation is marked with.
+fn apply_appearance(doc: &mut Document, r: ObjRef, d: &Dict, stream: Stream, missing: Option<char>) -> Result<(), AnnotError> {
     let ap = doc.add(Object::Stream(stream));
     // A copy (a shared /AP is left alone) that keeps unknown entries; the old down and rollover
     // appearances would show the previous look on press or hover, so they go with the old /N.
@@ -178,7 +214,7 @@ pub fn with_missing_appearances_cached(doc: &Document, cache: &mut AppearanceCac
             }
             if let Some(stream) = cache.get(r) {
                 // Fails only when `r` isn't a dictionary, which the cached build ruled out.
-                apply_appearance(copy.get_or_insert_with(|| doc.clone()), r, &d, stream).ok();
+                apply_appearance(copy.get_or_insert_with(|| doc.clone()), r, &d, stream, appearance::undrawable_text(&d).map(|(_, c)| c)).ok();
                 continue;
             }
             // Another program's stamp gets a drawing for display only (ISO 32000-2 Table 184). Its
@@ -188,10 +224,11 @@ pub fn with_missing_appearances_cached(doc: &Document, cache: &mut AppearanceCac
                 bare.remove(b"AP");
                 appearance::display_stamp(&bare)
             };
-            let Some(stream) = build_appearance(doc, &d).or_else(other_stamp) else { continue };
+            // (A display copy draws in the standard fonts only: nothing is embedded in a copy that is never saved.)
+            let Some(stream) = build_appearance(doc, &d, None).or_else(other_stamp) else { continue };
             cache.insert(r, &stream);
             // Fails only when `r` isn't a dictionary, which the build just ruled out.
-            apply_appearance(copy.get_or_insert_with(|| doc.clone()), r, &d, stream).ok();
+            apply_appearance(copy.get_or_insert_with(|| doc.clone()), r, &d, stream, appearance::undrawable_text(&d).map(|(_, c)| c)).ok();
         }
     }
     copy

@@ -1393,6 +1393,105 @@ fn drawings_resize_by_scaling_their_strokes() {
     assert!(matches!(set_rect(&mut doc, 0, i, [100.0, 400.0, 101.0, 401.0], &meta("")), Err(AnnotError::Invalid(_))));
 }
 
+/// WHIQ: comment text the standard fonts can't draw but the bundled Inter face can (Greek, Cyrillic,
+/// Turkish, Vietnamese) is written in that face, embedded in the document ONCE: it came out as `?`.
+/// Western European text stays in Helvetica; what neither font has is `?` and marked, as before.
+#[test]
+fn comment_text_beyond_western_european_is_drawn_in_the_embedded_face() {
+    let mut doc = fixture();
+    let mark = |doc: &Document, i: usize| pdfcraft_fonts::undrawn_mark(&list(doc, 0)[i]);
+    let ap_bytes = |doc: &Document, d: &Dict| -> Vec<u8> {
+        let n = d.get(b"AP").map(|a| doc.resolve(a)).and_then(|a| a.as_dict().and_then(|a| a.reference(b"N"))).expect("has /AP /N");
+        let Object::Stream(s) = &*doc.get(n) else { panic!("AP is not a stream") };
+        s.decoded().unwrap()
+    };
+    // The face the appearance names in its /Font resources.
+    let face_of = |doc: &Document, d: &Dict| -> Option<Object> {
+        let n = d.get(b"AP").map(|a| doc.resolve(a)).and_then(|a| a.as_dict().and_then(|a| a.reference(b"N")))?;
+        let Object::Stream(s) = &*doc.get(n) else { return None };
+        doc.dict(s.dict.get(b"Resources")?).and_then(|r| doc.dict(r.get(b"Font")?)).and_then(|f| f.get(b"PCFull0").cloned())
+    };
+    let shows = |doc: &Document, d: &Dict, text: &str| -> bool {
+        let Some(font) = face_of(doc, d) else { return false };
+        let metrics = pdfcraft_fonts::pdf::Metrics::from_dict(doc, &doc.dict(&font).unwrap());
+        let want = pdfcraft_fonts::literal(&metrics.encode(text).expect("the face has every character"));
+        ap_bytes(doc, d).windows(want.len()).any(|w| w == want.as_slice())
+    };
+    let texts = ["Αλλαγή πάχους", "Изменение стены", "Değişiklik ığşİĞŞ", "Thay đổi độ dày"];
+    let mut made = Vec::new();
+    for (i, t) in texts.iter().enumerate() {
+        let top = 650.0 - 60.0 * i as f64;
+        let mut boxed = new(0, Shape::TextBox { rect: [100.0, top - 50.0, 360.0, top], font_size: 12.0 });
+        boxed.contents = (*t).into();
+        made.push(add_annotation(&mut doc, &boxed, &meta(&format!("u{i}"))).unwrap());
+    }
+    for (&i, t) in made.iter().zip(texts) {
+        let d = &list(&doc, 0)[i];
+        assert!(ap_content(&doc, d).contains("/PCFull0 12 Tf"), "{t}: written in the embedded face: {}", ap_content(&doc, d));
+        assert!(shows(&doc, d, t), "{t}: every character is in the appearance, none replaced");
+        assert_eq!(mark(&doc, i), None, "{t}: nothing came out as ?");
+    }
+    // One font for the whole document: every comment names the same object, the catalog keeps it,
+    // and the font program is in the file once.
+    let faces: Vec<_> = made.iter().map(|&i| face_of(&doc, &list(&doc, 0)[i]).expect("a face")).collect();
+    assert!(faces.windows(2).all(|w| w[0] == w[1]), "the comments share one font: {faces:?}");
+    let catalog = doc.dict(&Object::Ref(doc.root().unwrap())).unwrap();
+    assert_eq!(catalog.get(b"PCAnnotFont"), Some(&faces[0]));
+    let programs = doc.scan_objects().filter(|(_, o)| matches!(&**o, Object::Stream(s) if s.dict.contains(b"PCFullFont"))).count();
+    assert_eq!(programs, 1, "the font program is embedded once");
+    let type0 = doc.scan_objects().filter(|(_, o)| o.as_dict().is_some_and(|d| d.name(b"Subtype") == Some(b"Type0"))).count();
+    assert_eq!(type0, 1, "and its maps and widths are written once");
+    // A restyle redraws in the face; Western European text goes back to Helvetica; a character
+    // neither font has is ? and marked while the Greek beside it is drawn.
+    let t = made[0];
+    set_style(&mut doc, 0, t, StyleChange::new(Some([1.0, 0.0, 0.0]), None, None, None), &meta("")).unwrap();
+    assert!(shows(&doc, &list(&doc, 0)[t], texts[0]));
+    set_contents(&mut doc, 0, t, "Wall thickness", &meta("")).unwrap();
+    let latin = ap_content(&doc, &list(&doc, 0)[t]);
+    assert!(latin.contains("/Helv 12 Tf") && latin.contains("(Wall thickness)") && !latin.contains("PCFull"), "{latin}");
+    set_contents(&mut doc, 0, t, "Αλφα 签", &meta("")).unwrap();
+    assert_eq!(mark(&doc, t), Some('签'));
+    assert!(shows(&doc, &list(&doc, 0)[t], "Αλφα ?"), "the Greek is drawn, the character no font has is ?");
+    // A dynamic stamp's by-line.
+    let stamp = Shape::Stamp { rect: [100.0, 100.0, 300.0, 150.0], stamp: StampKind::DynApproved, by: Some("By Иван Петров".into()) };
+    let s = add_annotation(
+        &mut doc,
+        &NewAnnotation { page: 0, style: Style::default_for(&stamp), shape: stamp, contents: String::new(), author: "Иван".into() },
+        &meta("s"),
+    )
+    .unwrap();
+    assert_eq!(mark(&doc, s), None);
+    assert!(shows(&doc, &list(&doc, 0)[s], "By Иван Петров"));
+    assert_eq!(face_of(&doc, &list(&doc, 0)[s]), Some(faces[0].clone()), "the stamp shares the document's font");
+    // A text box another program drew with Greek text: a restyle redraws it now (it was refused).
+    let mut foreign = Dict::new();
+    foreign.set(b"Type".to_vec(), Object::name("Annot"));
+    foreign.set(b"Subtype".to_vec(), Object::name("FreeText"));
+    foreign.set(b"Rect".to_vec(), Object::Array([100.0, 300.0, 300.0, 330.0].iter().map(|v| Object::Real(*v)).collect()));
+    foreign.set(b"DA".to_vec(), PdfString::literal(b"0 g /Helv 12 Tf".to_vec()));
+    foreign.set(b"Contents".to_vec(), PdfString::text("Καλημέρα"));
+    let mut drawn = Dict::new();
+    drawn.set(b"Type".to_vec(), Object::name("XObject"));
+    drawn.set(b"Subtype".to_vec(), Object::name("Form"));
+    drawn.set(b"BBox".to_vec(), Object::Array([0.0, 0.0, 200.0, 30.0].iter().map(|v| Object::Real(*v)).collect()));
+    let drawn = doc.add(Object::Stream(pdfcraft_cos::Stream::from_raw(drawn, b"BT /F1 12 Tf (\x01\x02) Tj ET".to_vec())));
+    let mut ap = Dict::new();
+    ap.set(b"N".to_vec(), Object::Ref(drawn));
+    foreign.set(b"AP".to_vec(), Object::Dict(ap));
+    let r = doc.add(Object::Dict(foreign));
+    let page = page_ref(&doc, 0).unwrap();
+    let mut on_page = annots(&doc, page);
+    on_page.push(Object::Ref(r));
+    set_annots(&mut doc, page, on_page).unwrap();
+    let k = list(&doc, 0).len() - 1;
+    set_style(&mut doc, 0, k, StyleChange::new(Some([1.0, 0.0, 0.0]), None, None, None), &meta("")).unwrap();
+    assert!(shows(&doc, &list(&doc, 0)[k], "Καλημέρα"));
+    // Through a save: a second parser accepts the file, and the text is still drawn.
+    let doc = reopen(&doc);
+    assert!(shows(&doc, &list(&doc, 0)[made[1]], texts[1]));
+    assert_eq!(mark(&doc, made[1]), None);
+}
+
 /// Comment text the standard fonts can't draw is kept, as Acrobat keeps it: a text box, Fill & Sign
 /// text or a dynamic stamp's by-line is added with its text as typed, its appearance draws `?` for
 /// those characters, and the comment is marked with the first one (cleared once all of it can be

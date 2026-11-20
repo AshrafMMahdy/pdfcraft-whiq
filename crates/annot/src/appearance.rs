@@ -9,9 +9,14 @@
 //! The note icons are PdfCraft's own drawings (AGENTS.md §1). Text boxes use the standard
 //! Helvetica font with WinAnsi encoding; line breaking uses [`text_width`], an approximation of
 //! Helvetica's proportions by character class (no font program or metrics file is bundled).
+//!
+//! WHIQ: text with a character the standard fonts can't draw (Greek, Cyrillic, Turkish, Vietnamese,
+//! Central European) is written in the bundled Inter face instead, embedded in the document once
+//! ([`UnicodeFace`], made by `crate::draw` where the document is at hand): it came out as `?`.
+//! What Inter can't draw either (CJK, Arabic, …) still comes out as `?` and is marked as before.
 
 use pdfcraft_cos::{Dict, Object, PdfString, Stream};
-use pdfcraft_fonts::{first_undrawable, literal, win_ansi};
+use pdfcraft_fonts::{first_undrawable, inter_width, literal, win_ansi, wrap_with};
 pub use pdfcraft_fonts::{helvetica_width as text_width, wrap};
 
 use crate::{NOTE_SIZE, Rgb, n};
@@ -311,8 +316,14 @@ fn text_turn(d: &Dict) -> i64 {
 /// dynamic stamp's "By …" line, and a redaction mark's overlay text (drawn when it is applied). `None` when all of
 /// it can be drawn.
 pub fn undrawable_text(d: &Dict) -> Option<(&'static str, char)> {
+    let (what, text) = drawn_text(d)?;
+    Some((what, first_undrawable(&text)?))
+}
+
+/// The text [`build`] draws for `d` in a font, and what it is (for a message).
+pub fn drawn_text(d: &Dict) -> Option<(&'static str, String)> {
     let text = |key: &[u8]| d.get(key).and_then(Object::as_string).map(PdfString::to_text);
-    let (what, text) = match d.name(b"Subtype")? {
+    Some(match d.name(b"Subtype")? {
         b"FreeText" => ("the comment's text", text(b"Contents")?),
         b"Line" if !d.contains(b"PCMeasureValue") => ("the line's caption", line_caption(d)?),
         b"Line" | b"PolyLine" | b"Polygon" => ("the measurement label", text(b"PCMeasureValue")?),
@@ -320,8 +331,98 @@ pub fn undrawable_text(d: &Dict) -> Option<(&'static str, char)> {
         // Drawn in Helvetica when the redaction is applied: refused when it is marked.
         b"Redact" => ("the redaction's overlay text", text(b"OverlayText")?),
         _ => return None,
-    };
-    Some((what, first_undrawable(&text)?))
+    })
+}
+
+/// The bundled Inter face embedded in a document, for the text of a generated appearance the
+/// standard fonts can't draw. `crate::draw` makes it (embedding needs the document) when
+/// [`needs_face`] says the text calls for it; without one everything is written in Helvetica.
+#[derive(Clone, Debug)]
+pub struct UnicodeFace {
+    /// The resource name the appearance's `/Font` dictionary gives it.
+    pub(crate) tag: String,
+    /// The font object (a reference to the embedded Type 0 font).
+    pub(crate) font: Object,
+    pub(crate) metrics: pdfcraft_fonts::pdf::Metrics,
+}
+
+/// Whether the bundled Inter face has a glyph for `c`.
+pub fn inter_draws(c: char) -> bool {
+    pdfcraft_fonts::embedding::covers(pdfcraft_fonts::INTER_REGULAR, c.encode_utf8(&mut [0; 4]))
+}
+
+/// Whether `text` is written in the embedded Inter face: it has a character the standard fonts
+/// can't draw and Inter can. One rule for the drawing, the embedding and the sizing of a text box.
+pub fn needs_face(text: &str) -> bool {
+    text.chars().any(|c| !matches!(c, '\n' | '\r') && first_undrawable(c.encode_utf8(&mut [0; 4])).is_some() && inter_draws(c))
+}
+
+/// The first character of `d`'s drawn text that comes out as `?` although the Inter face is used
+/// for what the standard fonts can't draw: neither has it. A redaction's overlay text is drawn in
+/// the standard fonts when it is applied, so there it is [`undrawable_text`].
+pub fn undrawn_text(d: &Dict) -> Option<(&'static str, char)> {
+    if d.name(b"Subtype") == Some(b"Redact") {
+        return undrawable_text(d);
+    }
+    let (what, text) = drawn_text(d)?;
+    let c = text.chars().find(|c| !matches!(c, '\n' | '\r') && first_undrawable(c.encode_utf8(&mut [0; 4])).is_some() && !inter_draws(*c))?;
+    Some((what, c))
+}
+
+/// Advance of `line` in the font the whole `text` it belongs to is written in ([`needs_face`]):
+/// Inter or Helvetica.
+pub fn text_width_for(text: &str, line: &str, size: f64) -> f64 {
+    if needs_face(text) { inter_width(line, size) } else { text_width(line, size) }
+}
+
+/// [`wrap`] in the font `text` is written in ([`needs_face`]).
+pub fn wrap_for(text: &str, size: f64, width: f64) -> Vec<String> {
+    if needs_face(text) { wrap_with(text, size, width, inter_width) } else { wrap(text, size, width) }
+}
+
+/// How one text of an appearance is written: in Helvetica, or in the embedded face when the text
+/// calls for it and the face is there.
+#[derive(Clone, Copy)]
+struct Writer<'a>(Option<&'a UnicodeFace>);
+
+impl<'a> Writer<'a> {
+    fn of(face: Option<&'a UnicodeFace>, text: &str) -> Self {
+        Self(face.filter(|_| needs_face(text)))
+    }
+
+    /// The `/Font` resource name for `Tf`.
+    fn tag(&self) -> &str {
+        self.0.map_or("Helv", |f| f.tag.as_str())
+    }
+
+    /// `text` as the string operand of `Tj`. A character the font has no glyph for is `?`.
+    fn show(&self, text: &str) -> Vec<u8> {
+        if let Some(f) = self.0 {
+            let drawn: String = text.chars().map(|c| if inter_draws(c) { c } else { '?' }).collect();
+            if let Some(bytes) = f.metrics.encode(&drawn) {
+                return literal(&bytes);
+            }
+        }
+        // WinAnsi bytes go into the stream as-is, not through UTF-8.
+        literal(&win_ansi(text))
+    }
+
+    fn width(&self, text: &str, size: f64) -> f64 {
+        if self.0.is_some() { inter_width(text, size) } else { text_width(text, size) }
+    }
+
+    fn wrap(&self, text: &str, size: f64, width: f64) -> Vec<String> {
+        if self.0.is_some() { wrap_with(text, size, width, inter_width) } else { wrap(text, size, width) }
+    }
+
+    /// The `/Font` resources for what this writer wrote: Helvetica, and the face when it is used.
+    fn resource(&self) -> Object {
+        let Object::Dict(mut fonts) = helvetica_resource() else { unreachable!("helvetica_resource is a dictionary") };
+        if let Some(f) = self.0 {
+            fonts.set(f.tag.as_bytes().to_vec(), f.font.clone());
+        }
+        Object::Dict(fonts)
+    }
 }
 
 /// `/Font` resources naming `/Helv`: standard Helvetica with WinAnsiEncoding.
@@ -382,6 +483,8 @@ struct AppearanceContext<'a> {
     opacity: f64,
     stroke: Option<Rgb>,
     width: f64,
+    /// The embedded face, when the document has one for this annotation's text.
+    face: Option<&'a UnicodeFace>,
 }
 
 #[derive(Default)]
@@ -406,7 +509,13 @@ impl AppearanceDrawing {
 /// Text the standard fonts can't draw comes out as `?`: [`undrawable_text`] says which, and
 /// [`crate::set_appearance`] marks the annotation with it (`pdfcraft_fonts::UNDRAWN_MARK`).
 pub fn build(d: &Dict) -> Option<Stream> {
-    let context = appearance_context(d)?;
+    build_with(d, None)
+}
+
+/// [`build`], writing text the standard fonts can't draw in `face` (the embedded Inter face) when
+/// there is one.
+pub fn build_with(d: &Dict, face: Option<&UnicodeFace>) -> Option<Stream> {
+    let context = appearance_context(d, face)?;
     let drawing = AppearanceDrawing::new(&context);
     match context.subtype {
         b"Text" => return draw_icon(&context, "Note", [1.0, 0.82, 0.0], drawing),
@@ -420,7 +529,7 @@ pub fn build(d: &Dict) -> Option<Stream> {
     finish_appearance(&context, drawing)
 }
 
-fn appearance_context(d: &Dict) -> Option<AppearanceContext<'_>> {
+fn appearance_context<'a>(d: &'a Dict, face: Option<&'a UnicodeFace>) -> Option<AppearanceContext<'a>> {
     // Imported measurement appearances may include leaders, captions and formatting that
     // this builder cannot reproduce. Preserve them rather than silently losing detail.
     if d.contains(b"Measure") && !d.contains(b"PCMeasureValue") {
@@ -442,6 +551,7 @@ fn appearance_context(d: &Dict) -> Option<AppearanceContext<'_>> {
         opacity: d.get(b"CA").and_then(|o| o.as_f64()).unwrap_or(1.0).clamp(0.0, 1.0),
         stroke: color(d, b"C")?,
         width: border_width(d),
+        face,
     })
 }
 
@@ -467,14 +577,15 @@ fn finish_appearance(context: &AppearanceContext<'_>, mut drawing: AppearanceDra
         let value = value.to_text();
         if value.chars().count() <= 256 && matches!(context.subtype, b"Line" | b"PolyLine" | b"Polygon") {
             let size = 10.0;
-            let x = (context.rect[0] + context.rect[2] - text_width(&value, size)) * 0.5;
+            let pen = Writer::of(context.face, &value);
+            let x = (context.rect[0] + context.rect[2] - pen.width(&value, size)) * 0.5;
             let y = context.rect[3] - 12.0;
             let col = context.stroke.unwrap_or([0.0, 0.47, 0.84]);
-            out.extend(format!("{}BT /Helv {} Tf {} {} Td ", rg(col), n(size), n(x), n(y)).bytes());
+            out.extend(format!("{}BT /{} {} Tf {} {} Td ", rg(col), pen.tag(), n(size), n(x), n(y)).bytes());
             // WinAnsi bytes (e.g. 0xB2 for "²") go into the stream as-is, not through UTF-8.
-            out.extend(literal(&win_ansi(&value)));
+            out.extend(pen.show(&value));
             out.extend_from_slice(b" Tj ET\n");
-            drawing.resources.set(b"Font".to_vec(), helvetica_resource());
+            drawing.resources.set(b"Font".to_vec(), pen.resource());
         }
     }
     Some(form(context.rect, &out, drawing.resources))
@@ -601,7 +712,7 @@ fn draw_line(context: &AppearanceContext<'_>, drawing: &mut AppearanceDrawing) -
         return None;
     }
     let fill = interior_color(d, Some(col)).unwrap_or(col);
-    let layout = line_layout(d, [(l[0], l[1]), (l[2], l[3])], w);
+    let layout = line_layout(d, [(l[0], l[1]), (l[2], l[3])], w, context.face.is_some());
     let [p, q] = layout.line;
     c.push_str(&format!("{}{}{} w 1 J 1 j\n{}", rg_stroke(col), rg(fill), n(w), dash(d)));
     for [s, e] in layout.leaders.iter().chain(&layout.strokes).chain(&layout.tick) {
@@ -614,14 +725,15 @@ fn draw_line(context: &AppearanceContext<'_>, drawing: &mut AppearanceDrawing) -
         }
     }
     if let Some((text, m)) = layout.caption {
-        // The caption is black, in the standard font the measurement label uses.
+        // The caption is black, in the font the measurement label uses.
+        let pen = Writer::of(context.face, &text);
         tail.extend(
-            format!("q 0 g BT /Helv {} Tf {} {} {} {} {} {} Tm ", n(CAPTION_SIZE), n(m[0]), n(m[1]), n(m[2]), n(m[3]), n(m[4]), n(m[5])).bytes(),
+            format!("q 0 g BT /{} {} Tf {} {} {} {} {} {} Tm ", pen.tag(), n(CAPTION_SIZE), n(m[0]), n(m[1]), n(m[2]), n(m[3]), n(m[4]), n(m[5]))
+                .bytes(),
         );
-        // WinAnsi bytes go into the stream as-is, not through UTF-8.
-        tail.extend(literal(&win_ansi(&text)));
+        tail.extend(pen.show(&text));
         tail.extend_from_slice(b" Tj ET Q\n");
-        res.set(b"Font".to_vec(), helvetica_resource());
+        res.set(b"Font".to_vec(), pen.resource());
     }
     Some(())
 }
@@ -880,7 +992,7 @@ fn draw_stamp(context: &AppearanceContext<'_>, mut drawing: AppearanceDrawing) -
             let kind = crate::StampKind::from_name(other)?;
             let by = d.get(b"PCByLine").and_then(|o| o.as_string()).map(PdfString::to_text);
             let sign_here = kind.group() == crate::StampGroup::SignHere;
-            return Some(turned(stamp(kind.label(), sign_here, draw, stroke.unwrap_or(kind.color()), by.as_deref(), opacity, res)));
+            return Some(turned(stamp(kind.label(), sign_here, draw, stroke.unwrap_or(kind.color()), by.as_deref(), opacity, res, context.face)));
         }
     }
     if turn != 0 {
@@ -964,34 +1076,36 @@ fn draw_free_text(context: &AppearanceContext<'_>, mut drawing: AppearanceDrawin
     let pad = 2.0 + bw;
     let width = (rect[2] - rect[0] - 2.0 * pad).max(1.0);
     let q = d.int(b"Q").unwrap_or(0);
+    let pen = Writer::of(context.face, &text);
     c.push_str(&format!(
-        "{} {} {} {} re W n\nBT\n/Helv {} Tf\n{}",
+        "{} {} {} {} re W n\nBT\n/{} {} Tf\n{}",
         n(rect[0]),
         n(rect[1]),
         n(rect[2] - rect[0]),
         n(rect[3] - rect[1]),
+        pen.tag(),
         n(size),
         rg(text_color)
     ));
     let mut out = c.into_bytes();
     let mut y = rect[3] - pad - size * 0.9;
-    for line in wrap(&text, size, width) {
+    for line in pen.wrap(&text, size, width) {
         if y < rect[1] - size {
             break;
         }
-        let lw = text_width(&line, size);
+        let lw = pen.width(&line, size);
         let x = match q {
             1 => rect[0] + pad + (width - lw) / 2.0,
             2 => rect[2] - pad - lw,
             _ => rect[0] + pad,
         };
         out.extend(format!("1 0 0 1 {} {} Tm ", n(x), n(y)).bytes());
-        out.extend(literal(&win_ansi(&line)));
+        out.extend(pen.show(&line));
         out.extend_from_slice(b" Tj\n");
         y -= size * 1.2;
     }
     out.extend_from_slice(b"ET\n");
-    res.set(b"Font".to_vec(), helvetica_resource());
+    res.set(b"Font".to_vec(), pen.resource());
     let mut stream = form(full, &out, res);
     if let Some(m) = matrix {
         stream.dict.set(b"Matrix".to_vec(), Object::Array(m.iter().copied().map(Object::Real).collect()));

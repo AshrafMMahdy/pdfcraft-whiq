@@ -58,7 +58,7 @@ pub(crate) fn display_stamp(d: &Dict) -> Option<Stream> {
     let stamp_intent = d.name(b"IT").is_none_or(|it| it == b"Stamp");
     let name = d.name(b"Name").or(stamp_intent.then_some(b"Draft".as_slice()));
     if let Some((label, col)) = name.and_then(standard_stamp) {
-        return Some(stamp(label, false, rect, stroke.unwrap_or(col), None, opacity, res));
+        return Some(stamp(label, false, rect, stroke.unwrap_or(col), None, opacity, res, None));
     }
     let [x0, y0, x1, y1] = rect;
     let (a0, b0, a1, b1) = (x0 + 0.5, y0 + 0.5, x1 - 0.5, y1 - 0.5);
@@ -210,7 +210,7 @@ pub(super) struct LineLayout {
 ///
 /// A zero-length or overflowing `/L` has no direction: it gets neither leader lines nor caption.
 /// Every point is finite; if anything derived from the entries is not, they are left out.
-pub(super) fn line_layout(d: &Dict, [a, b]: [(f64, f64); 2], w: f64) -> LineLayout {
+pub(super) fn line_layout(d: &Dict, [a, b]: [(f64, f64); 2], w: f64, face: bool) -> LineLayout {
     let plain = LineLayout { line: [a, b], strokes: vec![[a, b]], ..LineLayout::default() };
     let (dx, dy) = (b.0 - a.0, b.1 - a.1);
     let len = dx.hypot(dy);
@@ -236,7 +236,8 @@ pub(super) fn line_layout(d: &Dict, [a, b]: [(f64, f64); 2], w: f64) -> LineLayo
     let mut gap = None;
     if let Some(text) = line_caption(d) {
         let size = CAPTION_SIZE;
-        let width = text_width(&text, size);
+        // (measured in the font it is written in: the embedded face when the document has it and the text calls for it)
+        let width = if face { super::text_width_for(&text, &text, size) } else { text_width(&text, size) };
         // Reading direction, and "up" across it.
         let (tx, ty) = if ux < 0.0 || (ux == 0.0 && uy < 0.0) { (-ux, -uy) } else { (ux, uy) };
         let (vx, vy) = (-ty, tx);
@@ -272,7 +273,17 @@ pub(super) fn line_layout(d: &Dict, [a, b]: [(f64, f64); 2], w: f64) -> LineLayo
 
 /// A rubber stamp: a rounded frame (a pointed tag for sign-here stamps) with the label in bold
 /// capitals, and the dynamic stamps' "By … at …" line.
-pub(super) fn stamp(label: &str, sign_here: bool, rect: [f64; 4], col: Rgb, by: Option<&str>, opacity: f64, mut res: Dict) -> Stream {
+#[allow(clippy::too_many_arguments)]
+pub(super) fn stamp(
+    label: &str,
+    sign_here: bool,
+    rect: [f64; 4],
+    col: Rgb,
+    by: Option<&str>,
+    opacity: f64,
+    mut res: Dict,
+    face: Option<&super::UnicodeFace>,
+) -> Stream {
     let [x0, y0, x1, y1] = rect;
     let h = y1 - y0;
     let mut c = String::new();
@@ -364,17 +375,19 @@ pub(super) fn stamp(label: &str, sign_here: bool, rect: [f64; 4], col: Rgb, by: 
     );
     out.extend(literal(&win_ansi(label)));
     out.extend_from_slice(b" Tj\n");
+    let by_pen = super::Writer::of(face, by.unwrap_or_default());
     if let Some(b) = by {
         let mut s = by_h;
-        let bw = text_width(b, s);
+        let bw = by_pen.width(b, s);
         if bw > text_area.1 - text_area.0 - 4.0 {
             s *= (text_area.1 - text_area.0 - 4.0) / bw;
         }
-        let bw = text_width(b, s);
+        let bw = by_pen.width(b, s);
         out.extend(
-            format!("/Helv {} Tf\n1 0 0 1 {} {} Tm ", n(s), n(text_area.0 + (text_area.1 - text_area.0 - bw) / 2.0), n(y0 + h * 0.18)).bytes(),
+            format!("/{} {} Tf\n1 0 0 1 {} {} Tm ", by_pen.tag(), n(s), n(text_area.0 + (text_area.1 - text_area.0 - bw) / 2.0), n(y0 + h * 0.18))
+                .bytes(),
         );
-        out.extend(literal(&win_ansi(b)));
+        out.extend(by_pen.show(b));
         out.extend_from_slice(b" Tj\n");
     }
     out.extend_from_slice(b"ET\n");
@@ -389,6 +402,9 @@ pub(super) fn stamp(label: &str, sign_here: bool, rect: [f64; 4], col: Rgb, by: 
     let mut fonts = Dict::new();
     fonts.set(b"HelvB".to_vec(), font("Helvetica-Bold"));
     fonts.set(b"Helv".to_vec(), font("Helvetica"));
+    if let Some(f) = by_pen.0 {
+        fonts.set(f.tag.as_bytes().to_vec(), f.font.clone());
+    }
     res.set(b"Font".to_vec(), Object::Dict(fonts));
     form(rect, &out, res)
 }

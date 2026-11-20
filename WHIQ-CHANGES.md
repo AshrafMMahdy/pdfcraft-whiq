@@ -190,3 +190,22 @@ same load.
 - Tables: cell order across a row is approximate.
 - Pages turned 90° or upside down are still not straightened.
 - Hebrew and other scripts are not read.
+
+## 6. Comment text beyond Western European (`crates/annot`)
+
+Upstream writes the text of a generated comment appearance in standard Helvetica (WinAnsiEncoding): a character it lacks came
+out as `?`, kept and marked (`PCUndrawn`). An agent marking up a drawing in Greek, Cyrillic, Turkish or Vietnamese got `?` in its
+callouts (the platform's own, removed `markup_pdf` drew them).
+
+- Text with a character the standard fonts can't draw and the bundled Inter face can is written in Inter instead: a text box, a
+  callout, Fill & Sign text, a line's caption, a measurement label, a dynamic stamp's "By" line (`appearance::build_with`,
+  `UnicodeFace`, `needs_face`). The whole text of that comment is in Inter, measured and wrapped with Inter's advances.
+- The face is embedded ONCE per document (`draw::unicode_face`): the catalog's private entry `/PCAnnotFont` names the Type 0 font,
+  and every later comment offers it to `embedding::embed`, which reuses the same embedding (program, maps, widths).
+- Western European text is written exactly as before (Helvetica, byte for byte). A character neither font has (CJK, Arabic, …)
+  still comes out as `?` and the comment is marked, as before; a comment another program drew is refused a redraw only for such a
+  character (it was refused for any character outside WinAnsi).
+- Not changed: a redaction's overlay text (drawn in the standard fonts when applied: still refused), and the display copy of a
+  comment that has no appearance (drawn in the standard fonts, nothing is embedded in a copy that is never saved).
+- Tests: `annot` `comment_text_beyond_western_european_is_drawn_in_the_embedded_face`; `automation`
+  `text_the_standard_fonts_cannot_draw_is_never_silent_through_tools` (no warning for such text in a text box and a callout).

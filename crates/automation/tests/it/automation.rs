@@ -6030,6 +6030,14 @@ fn text_the_standard_fonts_cannot_draw_is_never_silent_through_tools() {
     warned(&out, &["a comment on page 1", "\"欢\" (U+6B22)", "every viewer"]);
     let out = ok(&mut a, "fill_sign_add", json!({ "doc": doc, "page": 1, "type": "text", "at": [20, 300], "text": "签名" }));
     warned(&out, &["U+7B7E"]);
+    // WHIQ: text the standard fonts lack and the bundled Inter face has (Greek, Cyrillic, Turkish, Vietnamese) is drawn in that
+    // face, embedded once: nothing came out as `?`, so there is nothing to say (it was kept and warned about, drawn as `?`).
+    for words in ["Αλλαγή πάχους τοιχίου", "Изменение толщины стены", "Değişiklik ığşİĞŞ", "Thay đổi độ dày tường"] {
+        let out = ok(&mut a, "comment_add", json!({ "doc": doc, "page": 1, "type": "textbox", "rect": [10, 250, 190, 290], "contents": words }));
+        assert!(out.get("warnings").is_none(), "{words}: {out}");
+        let out = ok(&mut a, "comment_add", json!({ "doc": doc, "page": 1, "type": "callout", "rect": [60, 440, 190, 480], "to": [20, 500], "contents": words }));
+        assert!(out.get("warnings").is_none(), "{words} in a callout: {out}");
+    }
     // A sticky note draws an icon, not its text: nothing to say.
     let out = ok(&mut a, "comment_add", json!({ "doc": doc, "page": 1, "type": "note", "at": [40, 40], "contents": "签名 OK", "author": "Ada" }));
     assert!(out.get("warnings").is_none(), "{out}");
